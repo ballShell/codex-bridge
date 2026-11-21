@@ -1,40 +1,42 @@
 # Codex Bridge
 
-**前店后厂的双模型协作插件**：把 OpenAI Codex CLI 封装为 Antigravity 的可控 Subagent。
+**English** | [简体中文](README.zh-CN.md)
 
-- **前店（Antigravity / Gemini）**：发挥“会说人话”的优势，负责需求对话、追问澄清、把模糊想法翻译为结构化工程任务书，并在执行后做结果验收与人话汇报。
-- **后厂（Codex CLI）**：发挥代码与工程能力强但“不爱说人话”的特点，专注复杂仓库设计、后端实现、多文件重构与代码审查——支持复杂任务“先只读出方案、确认后再落盘”，也支持日常小任务随调随用。
+A "front-of-house / back-of-house" Antigravity plugin that wraps OpenAI Codex CLI as a controllable subagent.
 
-## 适合谁
+- **Front-of-House (Antigravity / Gemini):** Handles natural conversation, clarifies vague requirements, translates intent into structured engineering briefs, and verifies and summarizes outcomes in plain human language.
+- **Back-of-House (Codex CLI):** Handles heavy repository design, backend implementation, multi-file refactoring, and read-only code review—supporting both two-phase plan-then-build confirmation and on-demand invocation for everyday tasks.
 
-- 习惯在 Antigravity 里用自然语言沟通需求，希望把重型编码、架构重构或 Code Review 委派给 Codex 执行的开发者。
-- 同时使用 Antigravity 与 OpenAI Codex CLI、不想手动在两个工具间来回复制上下文和 Prompt 的用户。
-- 运行前提：`Python 3.9+`（零三方包依赖），以及本机可用的 `codex` CLI（支持 `codex login`、`OPENAI_API_KEY` 或 `$CODEX_HOME/config.toml` 自定义 Provider）。
+## Who It's For
 
-## 安装
+- Developers who prefer discussing requirements naturally with Antigravity while delegating heavy coding, architecture work, or code reviews to Codex.
+- Users with both Antigravity and OpenAI Codex CLI access who want seamless cross-agent orchestration without manually copying prompts back and forth.
+- Requirements: `Python 3.9+` (zero third-party dependencies) and a working local `codex` CLI (`codex login`, `OPENAI_API_KEY`, or custom `model_provider` in `$CODEX_HOME/config.toml`).
 
-方式一：通过 Antigravity CLI 直接安装
+## Installation
+
+Install directly from GitHub via Antigravity CLI:
 
 ```bash
 agy plugin install https://github.com/ballShell/codex-bridge
 ```
 
-方式二：克隆到 Antigravity 全局插件目录
+Or clone into your global Antigravity plugins directory:
 
 ```bash
 git clone https://github.com/ballShell/codex-bridge.git ~/.gemini/config/plugins/codex-bridge
 ```
 
-> 可选环境变量：`CODEX_BIN`（自定义 `codex` 路径）、`CODEX_BRIDGE_ALLOW_DANGER_SANDBOX=1`（默认禁用无沙盒模式，仅在明确需要时手动开启）。
+> Optional environment variables: `CODEX_BIN` (custom `codex` binary path) and `CODEX_BRIDGE_ALLOW_DANGER_SANDBOX=1` (unsandboxed mode is blocked by default unless explicitly opted in).
 
-## 开源协议
+## License
 
-基于 [MIT License](LICENSE) 开源。
+Licensed under the [MIT License](LICENSE).
 
 ---
 
 <details>
-<summary>工作区元信息（AgentsWorkSpace）</summary>
+<summary>Workspace Metadata (AgentsWorkSpace)</summary>
 
 - **所属 Agent**：Antigravity (Gemini)
 - **目录性质**：持久化（长期保留）

@@ -231,8 +231,15 @@ class TestPluginBundle(unittest.TestCase):
             "CODEX_BRIDGE_ALLOW_DANGER_SANDBOX",
             "agy plugin install https://github.com/ballShell/codex-bridge",
             "MIT License",
+            "README.zh-CN.md",
         ):
             self.assertIn(doc_term, content)
+
+        zh_readme = REPO_ROOT / "README.zh-CN.md"
+        self.assertTrue(zh_readme.is_file(), "Missing README.zh-CN.md")
+        zh_content = zh_readme.read_text(encoding="utf-8")
+        self.assertIn("README.md", zh_content)
+        self.assertIn("MIT License", zh_content)
 
     def test_license_file_matches_mit_manifest(self) -> None:
         license_path = REPO_ROOT / "LICENSE"
