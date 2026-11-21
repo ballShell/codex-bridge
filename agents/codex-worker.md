@@ -36,7 +36,7 @@ Invoke tools on `ServerName="codex-bridge_codex"` via `call_mcp_tool` (or direct
 - `codex_plan`: `{ "prompt": "...", "cwd": "<abs_cwd>", ... }` — strict read-only analysis/planning (optional: `model`, `reasoning_effort`, `images`, `wait_seconds`).
 - `codex_run`: `{ "prompt": "...", "cwd": "<abs_cwd>", "sandbox": "workspace-write" | "read-only", ... }` — execution or follow-up (optional: `session_id`, `model`, `reasoning_effort`, `images`, `async_mode`, `wait_seconds`).
 - `codex_review`: `{ "cwd": "<abs_cwd>", "mode": "uncommitted" | "base" | "commit" | "custom", ... }` — read-only review (pass `base_branch` for `base`, `commit_sha` for `commit`, `prompt` for `custom`; optional: `title`, `model`, `wait_seconds`).
-- `codex_poll`: `{ "task_id": "<id>", "wait_seconds": 30 }` — lazy tool; whenever any call returns `status == "running"`, poll `codex_poll` via `call_mcp_tool` until `status` becomes `"completed"` or `"failed"`.
+- `codex_poll`: `{ "task_id": "<id>", "wait_seconds": 30 }` — lazy tool; whenever any call returns `status == "running"`, poll `codex_poll` via `call_mcp_tool` until `status` becomes `"completed"`, `"failed"`, or `"error"`.
 
 ### Handling Failures
 

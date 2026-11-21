@@ -9,7 +9,7 @@ Pair **Gemini's conversational clarity** with **OpenAI Codex CLI** as a controll
 ## Why Codex Bridge?
 
 - **Gemini as Translator & Orchestrator:** Clarifies vague requirements in your language, drafts structured engineering briefs, translates Codex proposals into plain trade-offs, and verifies touched files without dumping raw JSONL logs.
-- **Codex as Engineering Worker:** Executes deep architecture planning (`codex_plan`), workspace edits (`codex_run`), session resumption (`session_id`), and read-only code reviews (`codex_review`) via the stable `codex exec`, `codex exec resume`, and `codex review` CLI commands.
+- **Codex as Engineering Worker:** Executes deep architecture planning (`codex_plan`), workspace edits (`codex_run`), session resumption (`session_id`), and read-only code reviews (`codex_review`) via the stable `codex exec`, `codex exec resume`, and `codex exec review` (plus `codex exec -s read-only` for focused target+prompt reviews) CLI commands.
 - **Safety by Design:**
   - `codex_plan` and `codex_review` strictly enforce read-only execution at the subprocess boundary.
   - `codex_run` defaults to `workspace-write` and rejects `danger-full-access` unless `CODEX_BRIDGE_ALLOW_DANGER_SANDBOX=1` is explicitly set.
@@ -46,7 +46,7 @@ Antigravity (Gemini) ── rules/AGENTS.md + skills/
    codex --version
    codex login status
    ```
-   If not authenticated yet, run `codex login` (or export `OPENAI_API_KEY` in your environment).
+   If not authenticated yet, run `codex login`, export `OPENAI_API_KEY`, or configure a custom `model_provider` in `$CODEX_HOME/config.toml` (defaults to `~/.codex/config.toml`).
 
 ---
 
@@ -80,6 +80,7 @@ chmod 755 ~/.gemini/config/plugins/codex-bridge/scripts/codex_mcp_server.py \
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `CODEX_BIN` | Auto-detected (`codex` on `PATH`, `/opt/homebrew/bin/codex`, `/usr/local/bin/codex`) | Override path to the `codex` CLI binary. |
+| `CODEX_HOME` | `~/.codex` | Optional Codex CLI home directory; `codex_status` checks `$CODEX_HOME/config.toml` for custom `model_provider` auth readiness without reading secrets. |
 | `CODEX_BRIDGE_ALLOW_DANGER_SANDBOX` | Unset (`0`) | Set to `1` only if you explicitly want to allow `sandbox="danger-full-access"` in `codex_run`. |
 
 You can set optional environment variables inside your Antigravity plugin/MCP environment if `codex` lives in a non-standard location. Do **not** define `PLUGIN_ROOT` or `PLUGIN_DATA` inside `mcp_config.json` `env`; Antigravity expands `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` natively.
@@ -92,7 +93,7 @@ You can set optional environment variables inside your Antigravity plugin/MCP en
   - `codex_status` *(eager, foreground)* — Checks binary resolution, version, `codex login status`, `CODEX_BRIDGE_ALLOW_DANGER_SANDBOX`, and target Git repository state.
   - `codex_plan` *(eager)* — Runs `codex exec -s read-only --json` and returns a structured summary plus `session_id`.
   - `codex_run` *(eager)* — Executes a fresh task or resumes an approved `session_id` via `codex exec resume`, reporting `changed_files`, `pre_existing_dirty_files`, `diff_stat`, and structured `resume_failed` hints.
-  - `codex_review` *(eager)* — Runs read-only `codex review` in `uncommitted`, `base`, `commit`, or `custom` mode.
+  - `codex_review` *(eager)* — Runs read-only `codex exec review` (enforcing `sandbox_mode="read-only"`) in `uncommitted`, `base`, `commit`, or `custom` mode, automatically routing focused target+`prompt` reviews via `codex exec -s read-only`.
   - `codex_poll` *(lazy)* — Polls long-running or `async_mode: true` background tasks persisted under `${PLUGIN_DATA}`.
 - **Always-On Rule (`rules/AGENTS.md`)** — Enforces Gemini's translator persona, smart routing, cross-workspace `cwd` confirmation, and post-run verification.
 - **Skills (`skills/`)**

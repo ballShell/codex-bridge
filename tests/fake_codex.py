@@ -84,7 +84,16 @@ def _parse_exec_flags(args: list[str], *, allow_sandbox_and_cd: bool) -> tuple[d
             opts["output_last_message"], i = _next_arg(args, i, arg)
         elif arg in ("-i", "--image"):
             val, i = _next_arg(args, i, arg)
+            if val.startswith("-"):
+                print(
+                    f"error: a value is required for '{arg} <FILE>...' but none was supplied",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
             opts["images"].append(val)
+            while i + 1 < len(args) and not args[i + 1].startswith("-"):
+                i += 1
+                opts["images"].append(args[i])
         elif arg == "--uncommitted":
             opts["uncommitted"] = True
         elif arg == "--base":

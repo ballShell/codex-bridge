@@ -49,7 +49,7 @@ Choose the leanest tool that matches the user's request:
 
 If `codex_plan`, `codex_run` (including `async_mode: true`), or `codex_review` returns `status == "running"` with a `task_id`:
 1. Call `call_mcp_tool(ServerName="codex-bridge_codex", ToolName="codex_poll", Arguments={"task_id": "<task_id>", "wait_seconds": 30})`.
-2. Repeat while `status == "running"` (giving the user concise progress updates if needed) until `status` is `"completed"` or `"failed"`.
+2. Repeat while `status == "running"` (giving the user concise progress updates if needed) until `status` is `"completed"`, `"failed"`, or `"error"`.
 
 ## Step 4: Verify & Translate Back to the User
 

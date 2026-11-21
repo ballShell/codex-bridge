@@ -621,7 +621,7 @@ def _append_common_exec_tail(
         cmd.extend(["-c", f"model_reasoning_effort={json.dumps(reasoning_effort)}"])
     for img in images:
         cmd.extend(["-i", img])
-    if prompt.startswith("-"):
+    if images or prompt.startswith("-"):
         cmd.append("--")
     cmd.append(prompt)
     return cmd
@@ -926,6 +926,8 @@ class CodexTaskManager:
                 "--json",
                 "-o",
                 str(last_msg_path),
+                "-c",
+                f"sandbox_mode={json.dumps('read-only')}",
             ]
             if not git_info["is_git_repo"]:
                 cmd.append("--skip-git-repo-check")
@@ -1212,6 +1214,8 @@ class CodexTaskManager:
             with task.lock:
                 stdout_text = "".join(task.stdout_lines)
                 stderr_text = "".join(task.stderr_lines)
+                task.stdout_lines.clear()
+                task.stderr_lines.clear()
                 live_session_id = task.session_id
 
             parsed = parse_jsonl_output(stdout_text)
@@ -1312,6 +1316,8 @@ class CodexTaskManager:
                 failed=True,
             )
             with task.lock:
+                task.stdout_lines.clear()
+                task.stderr_lines.clear()
                 task.result = fallback
                 self._persist_task_unlocked(task.task_id, fallback)
         finally:

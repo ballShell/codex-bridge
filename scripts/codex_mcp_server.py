@@ -28,7 +28,7 @@ from codex_runner import (  # noqa: E402
 
 SERVER_INFO = {"name": "codex-bridge", "version": "0.1.0"}
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-03-26", "2024-11-05")
-DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+DEFAULT_PROTOCOL_VERSION = "2025-03-26"
 
 SERVER_INSTRUCTIONS = (
     "Bridge to OpenAI Codex CLI. Act as a clear translator between the user and Codex "

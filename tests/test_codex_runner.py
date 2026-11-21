@@ -272,6 +272,7 @@ class TestCodexTaskManager(unittest.TestCase):
         self.assertEqual(self._flag_value(argv, "-m", "--model"), "gpt-5.4")
         self.assertEqual(self._flag_value(argv, "-i", "--image"), "diagram.png")
         self.assertIn('model_reasoning_effort="high"', argv)
+        self.assertEqual(argv[-2:], ["--", "Design the API module"])
 
         repo = self._init_git_repo("git_plan_repo")
         res_git = self.manager.run_plan(prompt="Inspect repo", cwd=str(repo))
@@ -486,6 +487,7 @@ class TestCodexTaskManager(unittest.TestCase):
         self.assertEqual(invocations[0]["cwd"], str(repo.resolve()))
         self.assertIn("--json", argv_uncommitted)
         self.assertIn("--uncommitted", argv_uncommitted)
+        self.assertEqual(self._flag_value(argv_uncommitted, "-c"), 'sandbox_mode="read-only"')
         self.assertNotIn("-s", argv_uncommitted)
         self.assertNotIn("-C", argv_uncommitted)
 
@@ -499,6 +501,7 @@ class TestCodexTaskManager(unittest.TestCase):
 
         argv_custom = invocations[2]["argv"]
         self.assertEqual(argv_custom[:2], ["exec", "review"])
+        self.assertEqual(self._flag_value(argv_custom, "-c"), 'sandbox_mode="read-only"')
         self.assertIn("audit error handling", argv_custom)
         self.assertNotIn("--uncommitted", argv_custom)
         self.assertNotIn("--base", argv_custom)
@@ -506,11 +509,13 @@ class TestCodexTaskManager(unittest.TestCase):
 
         argv_base = invocations[3]["argv"]
         self.assertEqual(argv_base[:2], ["exec", "review"])
+        self.assertEqual(self._flag_value(argv_base, "-c"), 'sandbox_mode="read-only"')
         self.assertEqual(self._flag_value(argv_base, "--base"), "main")
         self.assertEqual(self._flag_value(argv_base, "-m", "--model"), "gpt-5.4")
 
         argv_commit = invocations[4]["argv"]
         self.assertEqual(argv_commit[:2], ["exec", "review"])
+        self.assertEqual(self._flag_value(argv_commit, "-c"), 'sandbox_mode="read-only"')
         self.assertEqual(self._flag_value(argv_commit, "--commit"), "HEAD")
         self.assertEqual(self._flag_value(argv_commit, "--title"), "Initial commit")
 
@@ -755,6 +760,58 @@ class TestCodexTaskManager(unittest.TestCase):
             self.assertEqual(res["status"], "completed")
         resource_warnings = [w for w in caught if issubclass(w.category, ResourceWarning)]
         self.assertEqual(resource_warnings, [])
+
+    def test_multiple_images_do_not_swallow_prompt_in_exec_or_resume(self) -> None:
+        repo = self._init_git_repo("images_repo")
+        images = ["img1.png", "img2.png"]
+        prompt = "Explain this diagram"
+
+        plan_res = self.manager.run_plan(prompt=prompt, cwd=str(repo), images=images)
+        self.assertEqual(plan_res["status"], "completed")
+        self.assertIn(prompt, plan_res["summary"])
+
+        exec_res = self.manager.run_exec(prompt=prompt, cwd=str(repo), images=images)
+        self.assertEqual(exec_res["status"], "completed")
+        self.assertIn(prompt, exec_res["summary"])
+
+        resume_res = self.manager.run_exec(
+            prompt=prompt,
+            cwd=str(repo),
+            session_id="thr_img_resume",
+            images=images,
+        )
+        self.assertEqual(resume_res["status"], "completed")
+        self.assertIn(prompt, resume_res["summary"])
+
+        invocations = self._read_invocations()
+        self.assertEqual(len(invocations), 3)
+        for idx, inv in enumerate(invocations):
+            argv = inv["argv"]
+            if idx == 2:
+                self.assertEqual(argv[:3], ["exec", "resume", "thr_img_resume"])
+            else:
+                self.assertEqual(argv[0], "exec")
+                self.assertNotEqual(argv[1], "resume")
+            sep_idx = argv.index("--")
+            self.assertEqual(argv[sep_idx + 1 :], [prompt])
+            self.assertLess(argv.index("img1.png"), sep_idx)
+            self.assertLess(argv.index("img2.png"), sep_idx)
+
+    def test_collect_task_clears_raw_stream_buffers_after_completion(self) -> None:
+        repo = self._init_git_repo("buffer_repo")
+
+        ok_res = self.manager.run_exec(prompt="Buffer release ok", cwd=str(repo))
+        self.assertEqual(ok_res["status"], "completed")
+        ok_task = self.manager._tasks[ok_res["task_id"]]
+        self.assertEqual(ok_task.stdout_lines, [])
+        self.assertEqual(ok_task.stderr_lines, [])
+
+        with mock.patch.dict(os.environ, {"FAKE_CODEX_FAIL_MODE": "exec"}):
+            fail_res = self.manager.run_exec(prompt="Buffer release fail", cwd=str(repo))
+        self.assertEqual(fail_res["status"], "failed")
+        fail_task = self.manager._tasks[fail_res["task_id"]]
+        self.assertEqual(fail_task.stdout_lines, [])
+        self.assertEqual(fail_task.stderr_lines, [])
 
 
 if __name__ == "__main__":

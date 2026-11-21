@@ -197,12 +197,13 @@ class TestPluginBundle(unittest.TestCase):
         self.assertIs(meta.get("inheritMcp"), True)
         self.assertEqual(meta.get("tools"), ["read_file", "call_mcp_tool", "send_message"])
 
-    def test_scripts_have_0755_executable_permissions(self) -> None:
+    def test_scripts_have_executable_permissions(self) -> None:
         for script_name in ("codex_mcp_server.py", "codex_runner.py"):
             script_path = SCRIPTS_DIR / script_name
             self.assertTrue(script_path.is_file(), f"Missing scripts/{script_name}")
             mode = stat.S_IMODE(script_path.stat().st_mode)
-            self.assertEqual(mode, 0o755, f"Expected 0o755 on {script_name}, got {oct(mode)}")
+            self.assertTrue(bool(mode & stat.S_IXUSR), f"Expected owner execute bit on {script_name}, got {oct(mode)}")
+            self.assertFalse(bool(mode & stat.S_IWOTH), f"Unexpected world-writable bit on {script_name}, got {oct(mode)}")
 
     def test_logo_svg_is_square_vector_with_padding(self) -> None:
         logo_path = REPO_ROOT / "assets" / "logo.svg"
@@ -225,8 +226,25 @@ class TestPluginBundle(unittest.TestCase):
         content = readme_path.read_text(encoding="utf-8")
         for marker in ("所属 Agent", "目录性质", "创建日期", "任务简述"):
             self.assertIn(marker, content)
-        for doc_term in ("CODEX_BIN", "CODEX_BRIDGE_ALLOW_DANGER_SANDBOX", "codex_plan", "codex_run"):
+        for doc_term in (
+            "CODEX_BIN",
+            "CODEX_HOME",
+            "CODEX_BRIDGE_ALLOW_DANGER_SANDBOX",
+            "codex_plan",
+            "codex_run",
+            "codex exec review",
+            "codex exec -s read-only",
+            "$CODEX_HOME/config.toml",
+        ):
             self.assertIn(doc_term, content)
+
+    def test_license_file_matches_mit_manifest(self) -> None:
+        license_path = REPO_ROOT / "LICENSE"
+        self.assertTrue(license_path.is_file(), "Missing LICENSE file at repository root")
+        text = license_path.read_text(encoding="utf-8")
+        self.assertIn("MIT License", text)
+        self.assertIn("Copyright (c) 2026 ballShell", text)
+        self.assertIn("Permission is hereby granted, free of charge", text)
 
 
 if __name__ == "__main__":

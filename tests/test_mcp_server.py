@@ -183,6 +183,31 @@ class TestMcpServer(unittest.TestCase):
             rc, _ = client.close()
         self.assertEqual(rc, 0)
 
+    def test_initialize_falls_back_to_latest_supported_protocol_version(self) -> None:
+        client = _McpClient(self.data_dir)
+        try:
+            unknown_resp = client.request(
+                "initialize",
+                {
+                    "protocolVersion": "2099-01-01",
+                    "capabilities": {},
+                    "clientInfo": {"name": "future-client", "version": "1.0.0"},
+                },
+            )
+            self.assertEqual(unknown_resp["result"]["protocolVersion"], "2025-03-26")
+
+            omitted_resp = client.request(
+                "initialize",
+                {
+                    "capabilities": {},
+                    "clientInfo": {"name": "legacy-client", "version": "1.0.0"},
+                },
+            )
+            self.assertEqual(omitted_resp["result"]["protocolVersion"], "2025-03-26")
+        finally:
+            rc, _ = client.close()
+        self.assertEqual(rc, 0)
+
     def test_tools_call_plan_then_resume_run_and_review(self) -> None:
         args_file = self.tmpdir / "fake_codex_args.jsonl"
         client = _McpClient(
