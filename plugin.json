@@ -13,6 +13,8 @@
   "author": {
     "name": "ballShell"
   },
+  "homepage": "https://github.com/ballShell/codex-bridge",
+  "repository": "https://github.com/ballShell/codex-bridge",
   "license": "MIT",
   "keywords": [
     "codex",

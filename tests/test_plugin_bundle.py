@@ -228,13 +228,9 @@ class TestPluginBundle(unittest.TestCase):
             self.assertIn(marker, content)
         for doc_term in (
             "CODEX_BIN",
-            "CODEX_HOME",
             "CODEX_BRIDGE_ALLOW_DANGER_SANDBOX",
-            "codex_plan",
-            "codex_run",
-            "codex exec review",
-            "codex exec -s read-only",
-            "$CODEX_HOME/config.toml",
+            "agy plugin install https://github.com/ballShell/codex-bridge",
+            "MIT License",
         ):
             self.assertIn(doc_term, content)
 
