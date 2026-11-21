@@ -426,6 +426,16 @@ def _read_git_head(cwd: Path) -> str | None:
     return head or None
 
 
+def _read_git_toplevel(cwd: Path) -> Path:
+    top = _git_output(cwd, ["rev-parse", "--show-toplevel"]).strip()
+    if top:
+        try:
+            return Path(top).resolve()
+        except OSError:
+            return Path(top)
+    return cwd
+
+
 def _capture_git_porcelain(cwd: Path) -> dict[str, str]:
     try:
         proc = subprocess.run(
@@ -483,17 +493,19 @@ def _file_fingerprint(path: Path) -> tuple[Any, ...]:
 
 
 def _capture_git_baseline(cwd: Path) -> dict[str, Any]:
-    status_map = _capture_git_porcelain(cwd)
-    fingerprints = {rel: _file_fingerprint(cwd / rel) for rel in status_map}
+    repo_root = _read_git_toplevel(cwd)
+    status_map = _capture_git_porcelain(repo_root)
+    fingerprints = {rel: _file_fingerprint(repo_root / rel) for rel in status_map}
     return {
-        "head": _read_git_head(cwd),
+        "repo_root": str(repo_root),
+        "head": _read_git_head(repo_root),
         "status": status_map,
         "fingerprints": fingerprints,
     }
 
 
-def _summarize_untracked_file(cwd: Path, rel_path: str) -> str:
-    target = cwd / rel_path
+def _summarize_untracked_file(repo_root: Path, rel_path: str) -> str:
+    target = repo_root / rel_path
     if target.is_symlink():
         return f" {rel_path} | symlink (untracked)"
     if not target.is_file():
@@ -514,18 +526,24 @@ def _compute_git_delta(
     if baseline is None:
         return [], [], None
 
+    repo_root_raw = baseline.get("repo_root")
+    repo_root = (
+        Path(repo_root_raw)
+        if isinstance(repo_root_raw, str) and repo_root_raw
+        else _read_git_toplevel(cwd)
+    )
     pre_head: str | None = baseline["head"]
     pre_status: dict[str, str] = baseline["status"]
     pre_fingerprints: dict[str, tuple[Any, ...]] = baseline["fingerprints"]
 
-    post_head = _read_git_head(cwd)
-    post_status = _capture_git_porcelain(cwd)
+    post_head = _read_git_head(repo_root)
+    post_status = _capture_git_porcelain(repo_root)
 
     changed_set: set[str] = set()
     for path, line in post_status.items():
         if path not in pre_status or line != pre_status[path]:
             changed_set.add(path)
-        elif _file_fingerprint(cwd / path) != pre_fingerprints.get(path):
+        elif _file_fingerprint(repo_root / path) != pre_fingerprints.get(path):
             changed_set.add(path)
 
     for path in pre_status:
@@ -534,10 +552,10 @@ def _compute_git_delta(
 
     head_moved = bool(post_head and pre_head != post_head)
     if pre_head and post_head and pre_head != post_head:
-        committed = _git_output(cwd, ["diff", "--name-only", pre_head, post_head])
+        committed = _git_output(repo_root, ["diff", "--name-only", pre_head, post_head])
         changed_set.update(line.strip() for line in committed.splitlines() if line.strip())
     elif pre_head is None and post_head is not None:
-        initial = _git_output(cwd, ["diff-tree", "--no-commit-id", "--name-only", "-r", post_head])
+        initial = _git_output(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", post_head])
         changed_set.update(line.strip() for line in initial.splitlines() if line.strip())
 
     pre_existing_dirty = sorted(
@@ -549,27 +567,27 @@ def _compute_git_delta(
 
     stat_blocks: list[str] = []
     if head_moved and pre_head and post_head:
-        committed_stat = _git_output(cwd, ["diff", "--stat", pre_head, post_head])
+        committed_stat = _git_output(repo_root, ["diff", "--stat", pre_head, post_head])
         if committed_stat:
             stat_blocks.append(committed_stat)
         dirty_changed = [p for p in changed_files if p in post_status and not post_status[p].startswith("?? ")]
         if dirty_changed:
-            dirty_stat = _git_output(cwd, ["diff", "--stat", "HEAD", "--", *dirty_changed])
+            dirty_stat = _git_output(repo_root, ["diff", "--stat", "HEAD", "--", *dirty_changed])
             if dirty_stat:
                 stat_blocks.append(dirty_stat)
     elif post_head:
-        tracked_stat = _git_output(cwd, ["diff", "--stat", "HEAD", "--", *changed_files])
+        tracked_stat = _git_output(repo_root, ["diff", "--stat", "HEAD", "--", *changed_files])
         if tracked_stat:
             stat_blocks.append(tracked_stat)
     else:
-        wt_stat = _git_output(cwd, ["diff", "--stat", "--", *changed_files])
-        idx_stat = _git_output(cwd, ["diff", "--cached", "--stat", "--", *changed_files])
+        wt_stat = _git_output(repo_root, ["diff", "--stat", "--", *changed_files])
+        idx_stat = _git_output(repo_root, ["diff", "--cached", "--stat", "--", *changed_files])
         for block in (wt_stat, idx_stat):
             if block:
                 stat_blocks.append(block)
 
     untracked_lines = [
-        _summarize_untracked_file(cwd, path)
+        _summarize_untracked_file(repo_root, path)
         for path in changed_files
         if post_status.get(path, "").startswith("?? ")
     ]
@@ -968,8 +986,14 @@ class CodexTaskManager:
             if record.get("status") != "running":
                 return record
             pid = record.get("pid")
-            if pid is not None and not _is_pid_alive(pid):
-                failed_record = dict(record)
+            owner_pid = record.get("owner_pid")
+            pid_dead = pid is not None and not _is_pid_alive(pid)
+            owner_dead = owner_pid is None or not _is_pid_alive(owner_pid)
+            if pid_dead and owner_dead:
+                latest = self._read_persisted_task(task_path)
+                if latest.get("status") != "running":
+                    return latest
+                failed_record = dict(latest)
                 failed_record["status"] = "failed"
                 failed_record["error"] = "Background task process is no longer running."
                 self._write_task_file(task_path, failed_record)
@@ -977,7 +1001,8 @@ class CodexTaskManager:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return record
-            time.sleep(min(0.1, remaining))
+            sleep_step = 0.02 if pid_dead else 0.1
+            time.sleep(min(sleep_step, remaining))
 
     def shutdown(self, terminate_running: bool = True, timeout: float = 2.0) -> None:
         """Clean up active tasks and threads (terminating running subprocess groups if requested)."""
@@ -1064,7 +1089,11 @@ class CodexTaskManager:
             self._tasks[task_id] = task
 
         with task.lock:
-            initial_record = self._build_running_record(task, pid=proc.pid)
+            initial_record = self._build_running_record(
+                task,
+                pid=proc.pid,
+                owner_pid=os.getpid(),
+            )
             self._persist_task_unlocked(task_id, initial_record)
 
         waiter = threading.Thread(target=self._collect_task, args=(task,), daemon=True)
@@ -1088,7 +1117,13 @@ class CodexTaskManager:
             task.done_event.wait(timeout=wait_seconds)
         return self._running_snapshot(task)
 
-    def _build_running_record(self, task: _TaskState, *, pid: int | None = None) -> dict[str, Any]:
+    def _build_running_record(
+        self,
+        task: _TaskState,
+        *,
+        pid: int | None = None,
+        owner_pid: int | None = None,
+    ) -> dict[str, Any]:
         record: dict[str, Any] = {
             "status": "running",
             "task_id": task.task_id,
@@ -1103,6 +1138,8 @@ class CodexTaskManager:
         }
         if pid is not None:
             record["pid"] = pid
+        if owner_pid is not None:
+            record["owner_pid"] = owner_pid
         return record
 
     def _running_snapshot(self, task: _TaskState) -> dict[str, Any]:

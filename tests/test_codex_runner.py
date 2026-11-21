@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import warnings
@@ -16,6 +17,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import codex_runner  # noqa: E402
 from codex_runner import (  # noqa: E402
     CodexRunnerError,
     CodexTaskManager,
@@ -621,12 +623,129 @@ class TestCodexTaskManager(unittest.TestCase):
         orphan_path = self.data_dir / "tasks" / f"{orphan_id}.json"
         orphan_path.parent.mkdir(parents=True, exist_ok=True)
         orphan_path.write_text(
-            json.dumps({"status": "running", "task_id": orphan_id, "pid": 99999999}),
+            json.dumps(
+                {
+                    "status": "running",
+                    "task_id": orphan_id,
+                    "pid": 99999999,
+                    "owner_pid": 99999998,
+                }
+            ),
             encoding="utf-8",
         )
         res = self.manager.poll_task(orphan_id, wait_seconds=0)
         self.assertEqual(res["status"], "failed")
         self.assertIn("no longer running", res["error"])
+
+    def test_run_exec_from_git_subdirectory_tracks_dirty_reedits_and_diff_stat(self) -> None:
+        repo = self._init_git_repo("subdir_repo")
+        pkg_dir = repo / "pkg"
+        sub_dir = pkg_dir / "sub"
+        sub_dir.mkdir(parents=True)
+        (pkg_dir / "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        (pkg_dir / "clean.py").write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "pkg/mod.py", "pkg/clean.py"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add pkg"], cwd=repo, check=True, capture_output=True)
+
+        # Pre-existing dirty files: one untracked in subdir, one tracked in pkg, one untouched at root
+        (sub_dir / "dirty_untracked.txt").write_text("before\n", encoding="utf-8")
+        (pkg_dir / "mod.py").write_text("def f():\n    return 2\n", encoding="utf-8")
+        (repo / "untouched.txt").write_text("keep\n", encoding="utf-8")
+
+        # 1) Re-edit pre-existing dirty untracked file inside subdir + create a new untracked file
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_CODEX_WRITE_FILE": "dirty_untracked.txt",
+                "FAKE_CODEX_WRITE_CONTENT": "after line 1\nafter line 2\n",
+            },
+        ):
+            res_reedit = self.manager.run_exec(
+                prompt="Re-edit dirty_untracked.txt from subdir",
+                cwd=str(sub_dir),
+            )
+
+        self.assertEqual(res_reedit["status"], "completed")
+        self.assertEqual(res_reedit["changed_files"], ["pkg/sub/dirty_untracked.txt"])
+        self.assertEqual(
+            res_reedit["pre_existing_dirty_files"],
+            ["pkg/mod.py", "untouched.txt"],
+        )
+        self.assertIsNotNone(res_reedit["diff_stat"])
+        self.assertIn("pkg/sub/dirty_untracked.txt | 2 + (untracked)", res_reedit["diff_stat"])
+
+        # 2) Modify a clean tracked file via subdir relative path and verify tracked git diff --stat works
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_CODEX_WRITE_FILE": "../clean.py",
+                "FAKE_CODEX_WRITE_CONTENT": "VALUE = 2\nEXTRA = 3\n",
+            },
+        ):
+            res_tracked = self.manager.run_exec(
+                prompt="Modify ../clean.py from subdir",
+                cwd=str(sub_dir),
+            )
+
+        self.assertEqual(res_tracked["status"], "completed")
+        self.assertEqual(res_tracked["changed_files"], ["pkg/clean.py"])
+        self.assertIsNotNone(res_tracked["diff_stat"])
+        self.assertIn("pkg/clean.py", res_tracked["diff_stat"])
+        self.assertNotIn("pkg/mod.py", res_tracked["diff_stat"])
+
+    def test_poll_task_cross_instance_during_finalization_and_orphan_cases(self) -> None:
+        repo = self._init_git_repo("cross_poll_repo")
+        entered_finalizing = threading.Event()
+        release_finalizing = threading.Event()
+        orig_compute_delta = codex_runner._compute_git_delta
+
+        def gated_compute_delta(cwd_arg: Path, baseline_arg: dict | None):
+            entered_finalizing.set()
+            release_finalizing.wait(timeout=5.0)
+            return orig_compute_delta(cwd_arg, baseline_arg)
+
+        with mock.patch.object(codex_runner, "_compute_git_delta", side_effect=gated_compute_delta):
+            try:
+                initial = self.manager.run_exec(
+                    prompt="Finalize slowly",
+                    cwd=str(repo),
+                    wait_seconds=0,
+                )
+                task_id = initial["task_id"]
+                self.assertEqual(initial["status"], "running")
+
+                task_file = self.data_dir / "tasks" / f"{task_id}.json"
+                persisted_initial = json.loads(task_file.read_text(encoding="utf-8"))
+                self.assertEqual(persisted_initial["owner_pid"], os.getpid())
+
+                self.assertTrue(entered_finalizing.wait(timeout=5.0))
+                other_manager = CodexTaskManager(data_dir=self.data_dir)
+                mid = other_manager.poll_task(task_id, wait_seconds=0)
+                self.assertEqual(mid["status"], "running")
+                persisted_mid = json.loads(task_file.read_text(encoding="utf-8"))
+                self.assertEqual(persisted_mid["status"], "running")
+            finally:
+                release_finalizing.set()
+
+            done = other_manager.poll_task(task_id, wait_seconds=5)
+            self.assertEqual(done["status"], "completed")
+
+        # Dead owner_pid but live pid should remain running
+        live_pid_id = "task_livepid123"
+        live_pid_path = self.data_dir / "tasks" / f"{live_pid_id}.json"
+        live_pid_path.write_text(
+            json.dumps(
+                {
+                    "status": "running",
+                    "task_id": live_pid_id,
+                    "pid": os.getpid(),
+                    "owner_pid": 99999998,
+                }
+            ),
+            encoding="utf-8",
+        )
+        still_running = other_manager.poll_task(live_pid_id, wait_seconds=0)
+        self.assertEqual(still_running["status"], "running")
 
     def test_no_resource_warnings_during_task_execution(self) -> None:
         repo = self._init_git_repo("warn_repo")
