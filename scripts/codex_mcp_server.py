@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -576,10 +577,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     server = McpServer(data_dir=args.data_dir)
+    install_sigterm = (
+        hasattr(signal, "SIGTERM")
+        and threading.current_thread() is threading.main_thread()
+    )
+    prev_sigterm = signal.getsignal(signal.SIGTERM) if install_sigterm else None
+
+    if install_sigterm:
+        def _handle_sigterm(_signum: int, _frame: Any) -> None:
+            # Ignore duplicate SIGTERM while serve_stdio()'s finally block terminates children.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+
     try:
         server.serve_stdio()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
+    finally:
+        if install_sigterm and prev_sigterm is not None:
+            signal.signal(signal.SIGTERM, prev_sigterm)
     return 0
 
 

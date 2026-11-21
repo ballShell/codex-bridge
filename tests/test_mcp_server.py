@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -407,6 +408,78 @@ class TestMcpServer(unittest.TestCase):
         finally:
             rc, _ = client.close()
         self.assertEqual(rc, 0)
+
+    def test_sigterm_during_active_sync_tool_call_terminates_child_process(self) -> None:
+        client = _McpClient(
+            self.data_dir,
+            extra_env={"FAKE_CODEX_SLEEP": "15"},
+        )
+        child_pid: int | None = None
+        try:
+            client.request("initialize", {"protocolVersion": "2024-11-05"})
+            client.send_notification("notifications/initialized")
+
+            assert client.proc.stdin is not None
+            sync_req = {
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "tools/call",
+                "params": {
+                    "name": "codex_run",
+                    "arguments": {
+                        "prompt": "Blocked synchronous task",
+                        "cwd": str(self.workdir),
+                        "async_mode": False,
+                    },
+                },
+            }
+            client.proc.stdin.write(json.dumps(sync_req) + "\n")
+            client.proc.stdin.flush()
+
+            tasks_dir = self.data_dir / "tasks"
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                for path in tasks_dir.glob("task_*.json"):
+                    try:
+                        record = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    pid = record.get("pid")
+                    if isinstance(pid, int) and pid > 0:
+                        child_pid = pid
+                        break
+                if child_pid is not None:
+                    break
+                time.sleep(0.02)
+
+            self.assertIsNotNone(child_pid, "Expected detached child codex PID to be persisted")
+            assert child_pid is not None
+
+            started = time.monotonic()
+            client.proc.send_signal(signal.SIGTERM)
+            rc = client.proc.wait(timeout=5.0)
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(rc, 0)
+            self.assertLess(elapsed, 5.0)
+
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+        finally:
+            if client.proc.poll() is None:
+                client.proc.kill()
+                client.proc.wait(timeout=5.0)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            if client.proc.stdin and not client.proc.stdin.closed:
+                client.proc.stdin.close()
+            if client.proc.stdout and not client.proc.stdout.closed:
+                client.proc.stdout.close()
+            if client.proc.stderr and not client.proc.stderr.closed:
+                client.proc.stderr.close()
 
 
 if __name__ == "__main__":
