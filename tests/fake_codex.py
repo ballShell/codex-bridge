@@ -124,9 +124,18 @@ def _handle_login(args: list[str]) -> int:
     return 2
 
 
-def _emit_jsonl_run(
+def _emit_jsonl_start(*, session_id: str, use_json: bool) -> None:
+    if not use_json:
+        return
+    for ev in (
+        {"type": "thread.started", "thread_id": session_id},
+        {"type": "turn.started"},
+    ):
+        print(json.dumps(ev), flush=True)
+
+
+def _emit_jsonl_finish(
     *,
-    session_id: str,
     summary: str,
     use_json: bool,
     output_path: str | None,
@@ -135,8 +144,6 @@ def _emit_jsonl_run(
 ) -> None:
     if use_json:
         events = [
-            {"type": "thread.started", "thread_id": session_id},
-            {"type": "turn.started"},
             {
                 "type": "item.completed",
                 "item": {
@@ -183,20 +190,21 @@ def _handle_exec(args: list[str]) -> int:
 
     if args and args[0] == "resume":
         opts, pos = _parse_exec_flags(args[1:], allow_sandbox_and_cd=False)
-        _maybe_sleep()
         if fail_mode in ("resume", "always"):
+            _maybe_sleep()
             err_msg = "Error: session not found or cannot be resumed"
             if opts["json"]:
                 print(json.dumps({"type": "error", "message": err_msg}), flush=True)
             print(err_msg, file=sys.stderr)
             return 1
         session_id = pos[0] if pos else os.environ.get("FAKE_CODEX_SESSION_ID", "thr_fake_resume")
+        _emit_jsonl_start(session_id=session_id, use_json=opts["json"])
+        _maybe_sleep()
         prompt = " ".join(pos[1:]) if len(pos) > 1 else ""
         sandbox = _extract_sandbox_from_config(opts["config"]) or "read-only"
         _maybe_mutate_workspace(Path.cwd(), sandbox)
         summary = f"Resumed session {session_id} (sandbox={sandbox}): {prompt}".strip()
-        _emit_jsonl_run(
-            session_id=session_id,
+        _emit_jsonl_finish(
             summary=summary,
             use_json=opts["json"],
             output_path=opts["output_last_message"],
@@ -205,17 +213,23 @@ def _handle_exec(args: list[str]) -> int:
 
     if args and args[0] == "review":
         opts, pos = _parse_exec_flags(args[1:], allow_sandbox_and_cd=False)
-        _maybe_sleep()
         target_flags = sum(1 for flag in (opts["uncommitted"], opts["base"], opts["commit"]) if flag)
+        if target_flags > 1:
+            print("error: '--uncommitted', '--base', and '--commit' are mutually exclusive", file=sys.stderr)
+            return 2
         if target_flags and pos:
             print("error: the argument '[PROMPT]' cannot be used with '--uncommitted'/'--base'/'--commit'", file=sys.stderr)
             return 2
         if fail_mode in ("review", "always"):
+            _maybe_sleep()
             err_msg = "Error: review failed"
             if opts["json"]:
                 print(json.dumps({"type": "error", "message": err_msg}), flush=True)
             print(err_msg, file=sys.stderr)
             return 1
+        session_id = os.environ.get("FAKE_CODEX_SESSION_ID", "thr_fake_review")
+        _emit_jsonl_start(session_id=session_id, use_json=opts["json"])
+        _maybe_sleep()
         mode_desc = (
             "uncommitted"
             if opts["uncommitted"]
@@ -226,8 +240,7 @@ def _handle_exec(args: list[str]) -> int:
             else f"custom={ ' '.join(pos) }"
         )
         summary = f"Review completed ({mode_desc}): no critical issues found."
-        _emit_jsonl_run(
-            session_id=os.environ.get("FAKE_CODEX_SESSION_ID", "thr_fake_review"),
+        _emit_jsonl_finish(
             summary=summary,
             use_json=opts["json"],
             output_path=opts["output_last_message"],
@@ -235,22 +248,23 @@ def _handle_exec(args: list[str]) -> int:
         return 0
 
     opts, pos = _parse_exec_flags(args, allow_sandbox_and_cd=True)
-    _maybe_sleep()
     if fail_mode in ("exec", "always"):
+        _maybe_sleep()
         err_msg = "Error: codex exec failed"
         if opts["json"]:
             print(json.dumps({"type": "error", "message": err_msg}), flush=True)
         print(err_msg, file=sys.stderr)
         return 1
 
+    session_id = os.environ.get("FAKE_CODEX_SESSION_ID", "thr_fake_001")
+    _emit_jsonl_start(session_id=session_id, use_json=opts["json"])
+    _maybe_sleep()
     target_dir = Path(opts["cd"]) if opts["cd"] else Path.cwd()
     sandbox = opts["sandbox"] or _extract_sandbox_from_config(opts["config"]) or "read-only"
     _maybe_mutate_workspace(target_dir, sandbox)
     prompt = " ".join(pos)
-    session_id = os.environ.get("FAKE_CODEX_SESSION_ID", "thr_fake_001")
     summary = f"Executed (sandbox={sandbox}): {prompt}".strip()
-    _emit_jsonl_run(
-        session_id=session_id,
+    _emit_jsonl_finish(
         summary=summary,
         use_json=opts["json"],
         output_path=opts["output_last_message"],
