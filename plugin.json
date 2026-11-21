@@ -1,0 +1,25 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "codex-bridge",
+  "displayName": "Codex Bridge",
+  "version": "0.1.0",
+  "description": "Pair Gemini's conversational clarity with OpenAI Codex CLI as an on-demand subagent for architecture, backend implementation, and code review.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Design and implement a new backend feature with Codex (plan first, then build)",
+    "Ask Codex to inspect this repo and propose a refactoring plan",
+    "Have Codex review my uncommitted changes and translate the findings"
+  ],
+  "author": {
+    "name": "ballShell"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "openai",
+    "subagent",
+    "translator",
+    "code-review",
+    "architecture"
+  ]
+}

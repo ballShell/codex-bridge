@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "codex": {
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/codex_mcp_server.py",
+        "--data-dir",
+        "${PLUGIN_DATA}"
+      ],
+      "timeoutSeconds": 900,
+      "tools": {
+        "codex_status": {
+          "eager": true,
+          "background": "off"
+        },
+        "codex_plan": {
+          "eager": true
+        },
+        "codex_run": {
+          "eager": true
+        },
+        "codex_review": {
+          "eager": true
+        },
+        "codex_poll": {
+          "eager": false
+        }
+      }
+    }
+  }
+}
