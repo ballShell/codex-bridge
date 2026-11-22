@@ -111,6 +111,10 @@ def _build_tool_definitions() -> list[dict[str, Any]]:
                         "items": {"type": "string"},
                         "description": "Optional list of image file paths to attach.",
                     },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "Optional Antigravity conversation ID owning this Codex task.",
+                    },
                     "wait_seconds": {
                         "type": "integer",
                         "minimum": 0,
@@ -163,6 +167,10 @@ def _build_tool_definitions() -> list[dict[str, Any]]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Optional list of image file paths to attach.",
+                    },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "Optional Antigravity conversation ID owning this Codex task.",
                     },
                     "async_mode": {
                         "type": "boolean",
@@ -244,6 +252,10 @@ def _build_tool_definitions() -> list[dict[str, Any]]:
                     "model": {
                         "type": "string",
                         "description": "Optional Codex model override.",
+                    },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "Optional Antigravity conversation ID owning this Codex task.",
                     },
                     "wait_seconds": {
                         "type": "integer",
@@ -334,6 +346,9 @@ class McpServer:
     ) -> None:
         self.manager = manager if manager is not None else CodexTaskManager(data_dir=data_dir)
         self._write_lock = threading.Lock()
+        self._workers_lock = threading.Lock()
+        self._active_workers: set[threading.Thread] = set()
+        self._shutting_down = threading.Event()
         self._tool_handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "codex_status": self._call_status,
             "codex_plan": self._call_plan,
@@ -349,7 +364,7 @@ class McpServer:
     def _call_plan(self, args: dict[str, Any]) -> dict[str, Any]:
         _validate_arg_keys(
             args,
-            {"prompt", "cwd", "model", "reasoning_effort", "images", "wait_seconds"},
+            {"prompt", "cwd", "model", "reasoning_effort", "images", "conversation_id", "wait_seconds"},
             ("prompt", "cwd"),
         )
         return self.manager.run_plan(
@@ -358,6 +373,7 @@ class McpServer:
             model=_opt_str(args, "model"),
             reasoning_effort=_opt_str(args, "reasoning_effort"),
             images=_opt_str_list(args, "images"),
+            conversation_id=_opt_str(args, "conversation_id"),
             wait_seconds=_opt_int(args, "wait_seconds", DEFAULT_WAIT_SECONDS),
         )
 
@@ -372,6 +388,7 @@ class McpServer:
                 "model",
                 "reasoning_effort",
                 "images",
+                "conversation_id",
                 "async_mode",
                 "wait_seconds",
             },
@@ -386,6 +403,7 @@ class McpServer:
             model=_opt_str(args, "model"),
             reasoning_effort=_opt_str(args, "reasoning_effort"),
             images=_opt_str_list(args, "images"),
+            conversation_id=_opt_str(args, "conversation_id"),
             async_mode=_opt_bool(args, "async_mode", False),
             wait_seconds=_opt_int(args, "wait_seconds", DEFAULT_WAIT_SECONDS),
         )
@@ -400,7 +418,7 @@ class McpServer:
     def _call_review(self, args: dict[str, Any]) -> dict[str, Any]:
         _validate_arg_keys(
             args,
-            {"cwd", "mode", "base_branch", "commit_sha", "title", "prompt", "model", "wait_seconds"},
+            {"cwd", "mode", "base_branch", "commit_sha", "title", "prompt", "model", "conversation_id", "wait_seconds"},
             ("cwd",),
         )
         mode = _opt_str(args, "mode")
@@ -412,6 +430,7 @@ class McpServer:
             title=_opt_str(args, "title"),
             prompt=_opt_str(args, "prompt"),
             model=_opt_str(args, "model"),
+            conversation_id=_opt_str(args, "conversation_id"),
             wait_seconds=_opt_int(args, "wait_seconds", DEFAULT_WAIT_SECONDS),
         )
 
@@ -517,10 +536,39 @@ class McpServer:
         }
 
     def _write_json(self, stdout: TextIO, payload: dict[str, Any]) -> None:
+        if self._shutting_down.is_set():
+            return
         encoded = json.dumps(payload, ensure_ascii=False)
         with self._write_lock:
-            stdout.write(encoded + "\n")
-            stdout.flush()
+            if self._shutting_down.is_set():
+                return
+            try:
+                stdout.write(encoded + "\n")
+                stdout.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                pass
+
+    def _run_tool_call_worker(self, msg: dict[str, Any], out_stream: TextIO) -> None:
+        current = threading.current_thread()
+        try:
+            response = self.handle_request(msg)
+            if response is not None and not self._shutting_down.is_set():
+                self._write_json(out_stream, response)
+        finally:
+            with self._workers_lock:
+                self._active_workers.discard(current)
+
+    def _dispatch_tool_call(self, msg: dict[str, Any], out_stream: TextIO) -> None:
+        worker = threading.Thread(
+            target=self._run_tool_call_worker,
+            args=(msg, out_stream),
+            daemon=True,
+        )
+        with self._workers_lock:
+            if self._shutting_down.is_set():
+                return
+            self._active_workers.add(worker)
+        worker.start()
 
     def serve_stdio(
         self,
@@ -530,6 +578,7 @@ class McpServer:
         """Serve newline-delimited JSON-RPC 2.0 requests on stdio until EOF."""
         in_stream = stdin if stdin is not None else sys.stdin
         out_stream = stdout if stdout is not None else sys.stdout
+        self._shutting_down.clear()
         try:
             for raw_line in in_stream:
                 line = raw_line.strip()
@@ -555,11 +604,21 @@ class McpServer:
                     )
                     continue
 
+                if msg.get("method") == "tools/call" and "id" in msg:
+                    self._dispatch_tool_call(msg, out_stream)
+                    continue
+
                 response = self.handle_request(msg)
                 if response is not None:
                     self._write_json(out_stream, response)
         finally:
+            self._shutting_down.set()
             self.manager.shutdown(terminate_running=True)
+            with self._workers_lock:
+                remaining = list(self._active_workers)
+            for worker in remaining:
+                if worker.is_alive():
+                    worker.join(timeout=1.0)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

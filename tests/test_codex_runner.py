@@ -813,6 +813,275 @@ class TestCodexTaskManager(unittest.TestCase):
         self.assertEqual(fail_task.stdout_lines, [])
         self.assertEqual(fail_task.stderr_lines, [])
 
+    def test_read_codex_config_defaults_and_normalize_usage(self) -> None:
+        codex_home = self.tmpdir / "cfg_home"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            'model = "gpt-6.2-sol" # top comment\n'
+            'model_reasoning_effort = "xhigh"\n'
+            'model_provider = "custom"\n'
+            '[profiles.fast]\n'
+            'model = "gpt-5-mini"\n',
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+            defaults = codex_runner.read_codex_config_defaults()
+        self.assertEqual(
+            defaults,
+            {
+                "model": "gpt-6.2-sol",
+                "model_reasoning_effort": "xhigh",
+                "model_provider": "custom",
+            },
+        )
+
+        self.assertIsNone(codex_runner.normalize_usage(None))
+        self.assertIsNone(codex_runner.normalize_usage({"foo": "bar"}))
+        self.assertEqual(
+            codex_runner.normalize_usage({"input_tokens": 120, "output_tokens": 45}),
+            {
+                "input_tokens": 120,
+                "cached_input_tokens": 0,
+                "output_tokens": 45,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 165,
+            },
+        )
+
+    def test_dashboard_snapshot_multi_worker_cli_dedup_and_clear_history(self) -> None:
+        repo = self._init_git_repo("dash_repo")
+        codex_home = self.tmpdir / "dash_codex_home"
+        sessions_dir = codex_home / "sessions" / "2026" / "11" / "22"
+        sessions_dir.mkdir(parents=True)
+        (codex_home / "config.toml").write_text(
+            'model = "gpt-6.2-sol"\nmodel_reasoning_effort = "high"\nmodel_provider = "custom"\n',
+            encoding="utf-8",
+        )
+
+        # CLI rollout that matches bridge task thr_bridge_dedup (should hydrate without duplicating)
+        matched_rollout = sessions_dir / "rollout-matched.jsonl"
+        matched_rollout.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {"id": "thr_bridge_dedup", "cwd": str(repo), "timestamp": "2026-11-22T01:00:00Z"},
+                        }
+                    ),
+                    json.dumps({"type": "turn_context", "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "token_count",
+                                "info": {
+                                    "total_token_usage": {
+                                        "input_tokens": 500,
+                                        "cached_input_tokens": 200,
+                                        "output_tokens": 80,
+                                        "reasoning_output_tokens": 20,
+                                        "total_tokens": 580,
+                                    }
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # Standalone CLI rollout (active recent file)
+        cli_only_rollout = sessions_dir / "rollout-cli-only.jsonl"
+        cli_only_rollout.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {"id": "thr_cli_only", "cwd": str(repo), "timestamp": "2026-11-22T01:05:00Z"},
+                        }
+                    ),
+                    json.dumps({"type": "turn_context", "payload": {"model": "gpt-6.1-sol", "effort": "medium"}}),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "token_count",
+                                "info": {
+                                    "total_token_usage": {
+                                        "input_tokens": 1000,
+                                        "cached_input_tokens": 400,
+                                        "output_tokens": 100,
+                                        "reasoning_output_tokens": 10,
+                                        "total_tokens": 1100,
+                                    }
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "response_item", "payload": {"type": "local_shell_call"}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+            done_res = self.manager.run_exec(
+                prompt="Finish first task",
+                cwd=str(repo),
+                model="gpt-6.2-sol",
+                reasoning_effort="high",
+            )
+            self.assertEqual(done_res["status"], "completed")
+            self.assertEqual(done_res["model"], "gpt-6.2-sol")
+            self.assertEqual(done_res["reasoning_effort"], "high")
+            self.assertEqual(done_res["activity"], "completed")
+            self.assertEqual(done_res["prompt_preview"], "Finish first task")
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "FAKE_CODEX_SESSION_ID": "thr_bridge_dedup",
+                    "FAKE_CODEX_SLEEP": "1.2",
+                },
+                clear=False,
+            ):
+                running_res = self.manager.run_exec(
+                    prompt="Background worker two",
+                    cwd=str(repo),
+                    model="gpt-5.4",
+                    reasoning_effort="xhigh",
+                    async_mode=True,
+                )
+            self.assertEqual(running_res["status"], "running")
+            self.assertEqual(running_res["model"], "gpt-5.4")
+            self.assertEqual(running_res["reasoning_effort"], "xhigh")
+
+            # Wait briefly so thread.started emits thr_bridge_dedup on the running task
+            deadline = time.monotonic() + 2.0
+            default_snap: dict[str, Any] = {}
+            while time.monotonic() < deadline:
+                default_snap = self.manager.get_dashboard_snapshot()
+                running_bridge = [
+                    w for w in default_snap["workers"] if w["worker_id"] == running_res["task_id"]
+                ]
+                if running_bridge and running_bridge[0].get("session_id") == "thr_bridge_dedup":
+                    break
+                time.sleep(0.05)
+
+            # Default snapshot only returns Antigravity bridge tasks (no standalone CLI sessions)
+            default_ids = [w["worker_id"] for w in default_snap["workers"]]
+            self.assertIn(done_res["task_id"], default_ids)
+            self.assertIn(running_res["task_id"], default_ids)
+            self.assertNotIn("cli:thr_cli_only", default_ids)
+            self.assertNotIn("cli:thr_bridge_dedup", default_ids)
+            self.assertEqual(default_snap["stats"]["cli_count"], 0)
+            self.assertEqual(default_snap["stats"]["bridge_count"], 2)
+            self.assertEqual(default_snap["stats"]["total_workers"], 2)
+
+            # Explicit include_cli_sessions=True includes standalone CLI sessions and deduplicates matched ones
+            snap = self.manager.get_dashboard_snapshot(include_cli_sessions=True, limit=50)
+            worker_ids = [w["worker_id"] for w in snap["workers"]]
+            self.assertIn(done_res["task_id"], worker_ids)
+            self.assertIn(running_res["task_id"], worker_ids)
+            self.assertIn("cli:thr_cli_only", worker_ids)
+            self.assertNotIn("cli:thr_bridge_dedup", worker_ids)
+            self.assertEqual(snap["stats"]["cli_count"], 1)
+            self.assertEqual(snap["stats"]["total_workers"], 3)
+            self.assertGreaterEqual(snap["stats"]["running_count"], 1)
+            models_seen = {entry["model"] for entry in snap["stats"]["by_model"]}
+            self.assertEqual(models_seen, {"gpt-6.2-sol", "gpt-5.4", "gpt-6.1-sol"})
+
+            # Clear finished bridge history while running task stays alive
+            cleared = self.manager.clear_finished_tasks()
+            self.assertEqual(cleared, 1)
+            after_clear = self.manager.get_dashboard_snapshot()
+            after_ids = [w["worker_id"] for w in after_clear["workers"]]
+            self.assertNotIn(done_res["task_id"], after_ids)
+            self.assertIn(running_res["task_id"], after_ids)
+
+            final_poll = self.manager.poll_task(running_res["task_id"], wait_seconds=5)
+            self.assertEqual(final_poll["status"], "completed")
+
+    def test_hook_correlation_and_per_conversation_isolation(self) -> None:
+        import codex_hook  # noqa: E402
+
+        repo = self._init_git_repo("conv_repo")
+        conv_a = "11111111-1111-1111-1111-111111111111"
+        conv_b = "22222222-2222-2222-2222-222222222222"
+
+        # 1. Direct MCP tool hook payload -> always allows with no overwrite and writes pending entry
+        direct_event = {
+            "conversationId": conv_a,
+            "toolCall": {
+                "name": "mcp_codex-bridge_codex_codex_run",
+                "args": {
+                    "prompt": "Refactor auth module",
+                    "cwd": str(repo),
+                },
+            },
+        }
+        res_direct = codex_hook.process_hook_input(json.dumps(direct_event), data_dir=self.manager.data_dir)
+        self.assertEqual(res_direct, {"decision": "allow"})
+
+        # 2. call_mcp_tool wrapper payload with stringified Arguments JSON -> also recorded
+        wrapper_event = {
+            "conversationId": conv_b,
+            "toolCall": {
+                "name": "call_mcp_tool",
+                "args": {
+                    "ServerName": "codex-bridge_codex",
+                    "ToolName": "codex_plan",
+                    "Arguments": json.dumps({"prompt": "Plan billing API", "cwd": str(repo)}),
+                },
+            },
+        }
+        res_wrapper = codex_hook.process_hook_input(json.dumps(wrapper_event), data_dir=self.manager.data_dir)
+        self.assertEqual(res_wrapper, {"decision": "allow"})
+
+        # 3. Unrelated tool and malformed JSON fail open safely
+        self.assertEqual(
+            codex_hook.process_hook_input(
+                json.dumps({"conversationId": conv_a, "toolCall": {"name": "run_command", "args": {"CommandLine": "ls"}}}),
+                data_dir=self.manager.data_dir,
+            ),
+            {"decision": "allow"},
+        )
+        self.assertEqual(
+            codex_hook.process_hook_input("{bad json", data_dir=self.manager.data_dir),
+            {"decision": "allow"},
+        )
+
+        # Claim matching pending entries into run_exec and run_plan
+        run_a = self.manager.run_exec(prompt="Refactor auth module", cwd=str(repo))
+        plan_b = self.manager.run_plan(prompt="Plan billing API", cwd=str(repo))
+        explicit_a = self.manager.run_exec(
+            prompt="Explicit conv task",
+            cwd=str(repo),
+            conversation_id=conv_a,
+        )
+        self.assertEqual(run_a["conversation_id"], conv_a)
+        self.assertEqual(plan_b["conversation_id"], conv_b)
+        self.assertEqual(explicit_a["conversation_id"], conv_a)
+
+        snap_a = self.manager.get_dashboard_snapshot(conversation_id=conv_a)
+        self.assertEqual(snap_a["stats"]["total_workers"], 2)
+        self.assertEqual({w["task_id"] for w in snap_a["workers"]}, {run_a["task_id"], explicit_a["task_id"]})
+
+        snap_b = self.manager.get_dashboard_snapshot(conversation_id=conv_b)
+        self.assertEqual(snap_b["stats"]["total_workers"], 1)
+        self.assertEqual(snap_b["workers"][0]["task_id"], plan_b["task_id"])
+
+        cleared_a = self.manager.clear_finished_tasks(conversation_id=conv_a)
+        self.assertEqual(cleared_a, 2)
+        self.assertEqual(self.manager.get_dashboard_snapshot(conversation_id=conv_a)["stats"]["total_workers"], 0)
+        self.assertEqual(self.manager.get_dashboard_snapshot(conversation_id=conv_b)["stats"]["total_workers"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

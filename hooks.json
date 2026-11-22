@@ -1,0 +1,16 @@
+{
+  "codex-conversation-tracker": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp_.*|call_mcp_tool|codex_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./scripts/codex_hook.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -198,12 +198,62 @@ class TestPluginBundle(unittest.TestCase):
         self.assertEqual(meta.get("tools"), ["read_file", "call_mcp_tool", "send_message"])
 
     def test_scripts_have_executable_permissions(self) -> None:
-        for script_name in ("codex_mcp_server.py", "codex_runner.py"):
+        for script_name in ("codex_mcp_server.py", "codex_runner.py", "codex_hook.py"):
             script_path = SCRIPTS_DIR / script_name
             self.assertTrue(script_path.is_file(), f"Missing scripts/{script_name}")
             mode = stat.S_IMODE(script_path.stat().st_mode)
             self.assertTrue(bool(mode & stat.S_IXUSR), f"Expected owner execute bit on {script_name}, got {oct(mode)}")
             self.assertFalse(bool(mode & stat.S_IWOTH), f"Unexpected world-writable bit on {script_name}, got {oct(mode)}")
+
+    def test_hooks_json_and_sidecar_bundle_valid(self) -> None:
+        hooks_path = REPO_ROOT / "hooks.json"
+        self.assertTrue(hooks_path.is_file(), "Missing hooks.json")
+        hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+        self.assertIsInstance(hooks, dict)
+        tracker = hooks.get("codex-conversation-tracker")
+        self.assertIsInstance(tracker, dict)
+        pre_tool_use = tracker.get("PreToolUse")
+        self.assertIsInstance(pre_tool_use, list)
+        self.assertTrue(len(pre_tool_use) >= 1)
+
+        sidecar_dir = REPO_ROOT / "sidecars" / "codex_monitor"
+        self.assertTrue(sidecar_dir.is_dir(), "Missing sidecars/codex_monitor")
+        for req_file in (
+            "package.json",
+            "sidecar.json",
+            "main.mjs",
+            "monitor_store.mjs",
+            "index.html",
+            "styles.css",
+            "sprites.js",
+            "app.js",
+        ):
+            self.assertTrue((sidecar_dir / req_file).is_file(), f"Missing sidecar file {req_file}")
+
+        sidecar_cfg = json.loads((sidecar_dir / "sidecar.json").read_text(encoding="utf-8"))
+        self.assertIs(sidecar_cfg.get("has_web_ui"), True)
+        views = sidecar_cfg.get("ui_config", {}).get("views", [])
+        self.assertEqual(len(views), 1)
+        self.assertEqual(views[0].get("entrypoint"), "SIDECAR_UI_ENTRYPOINT_AUX_PANE")
+
+        html_text = (sidecar_dir / "index.html").read_text(encoding="utf-8")
+        self.assertIn('src="/preload.js"', html_text)
+        self.assertNotRegex(html_text, re.compile(r'type\s*=\s*["\']module["\']', re.IGNORECASE))
+        self.assertIn('src="/sprites.js"', html_text)
+        self.assertIn('src="/app.js"', html_text)
+        app_div_match = re.search(r'<div\s+id="app"\s*>(.*?)</div>\s*<script', html_text, re.DOTALL | re.IGNORECASE)
+        self.assertIsNotNone(app_div_match, "Expected non-empty static fallback inside <div id='app'>")
+        self.assertTrue(app_div_match.group(1).strip(), "Expected non-empty fallback HTML inside <div id='app'>")
+        self.assertNotRegex(html_text, re.compile(r"<script[^>]+src=['\"]https?://", re.IGNORECASE))
+        self.assertNotRegex(html_text, re.compile(r"<link[^>]+href=['\"]https?://", re.IGNORECASE))
+
+        for js_name in ("sprites.js", "app.js"):
+            js_text = (sidecar_dir / js_name).read_text(encoding="utf-8")
+            self.assertNotRegex(js_text, re.compile(r"^\s*(?:import|export)\s", re.MULTILINE))
+
+        # Obsolete MCP App frontend artifacts must be removed
+        self.assertFalse((REPO_ROOT / "assets" / "dashboard.html").exists())
+        self.assertFalse((REPO_ROOT / "ui").exists())
 
     def test_logo_svg_is_square_vector_with_padding(self) -> None:
         logo_path = REPO_ROOT / "assets" / "logo.svg"

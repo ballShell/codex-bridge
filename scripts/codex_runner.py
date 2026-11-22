@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,12 @@ DEFAULT_WAIT_SECONDS = 120
 DEFAULT_POLL_WAIT_SECONDS = 30
 MAX_WAIT_SECONDS = 600
 MAX_FINGERPRINT_BYTES = 5 * 1024 * 1024
+CLI_STATUS_CACHE_TTL_SECONDS = 30.0
+PERSIST_THROTTLE_SECONDS = 0.8
+CLI_SESSION_ACTIVE_WINDOW_SECONDS = 12.0
+DEFAULT_DASHBOARD_LIMIT = 50
+MAX_DASHBOARD_LIMIT = 200
+MAX_CLI_SESSION_FILES = 25
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -111,19 +118,36 @@ def _strip_toml_inline_comment(raw_value: str) -> str:
     return raw_value.strip()
 
 
-def _detect_custom_provider() -> str | None:
-    """Inspect $CODEX_HOME/config.toml (or ~/.codex/config.toml) for model_provider without reading secrets."""
+def _get_codex_home_dir() -> Path:
     codex_home = os.environ.get("CODEX_HOME", "").strip()
-    base_dir = Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
-    config_path = base_dir / "config.toml"
+    return Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
+
+
+def _unquote_toml_string(raw_val: str) -> str | None:
+    val = _strip_toml_inline_comment(raw_val)
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+        val = val[1:-1]
+    cleaned = val.strip()
+    return cleaned or None
+
+
+def read_codex_config_defaults() -> dict[str, str | None]:
+    """Read non-secret top-level defaults from $CODEX_HOME/config.toml (or ~/.codex/config.toml)."""
+    defaults: dict[str, str | None] = {
+        "model": None,
+        "model_reasoning_effort": None,
+        "model_provider": None,
+    }
+    config_path = _get_codex_home_dir() / "config.toml"
     if not config_path.is_file():
-        return None
+        return defaults
 
     try:
         content = config_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return None
+        return defaults
 
+    target_keys = set(defaults.keys())
     in_top_level = True
     for line in content.splitlines():
         stripped = line.strip()
@@ -136,16 +160,16 @@ def _detect_custom_provider() -> str | None:
             continue
 
         key, raw_val = stripped.split("=", 1)
-        if key.strip() != "model_provider":
-            continue
+        clean_key = key.strip()
+        if clean_key in target_keys:
+            defaults[clean_key] = _unquote_toml_string(raw_val)
 
-        val = _strip_toml_inline_comment(raw_val)
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-            val = val[1:-1]
-        val = val.strip()
-        return val or None
+    return defaults
 
-    return None
+
+def _detect_custom_provider() -> str | None:
+    """Inspect $CODEX_HOME/config.toml (or ~/.codex/config.toml) for model_provider without reading secrets."""
+    return read_codex_config_defaults()["model_provider"]
 
 
 def check_auth_state(codex_bin: str | None) -> dict[str, Any]:
@@ -271,6 +295,7 @@ def check_status(cwd: str | None = None) -> dict[str, Any]:
             version = None
 
     auth = check_auth_state(codex_bin)
+    defaults = read_codex_config_defaults()
     git_info = inspect_git_repo(validated_cwd) if validated_cwd is not None else None
 
     return {
@@ -282,6 +307,8 @@ def check_status(cwd: str | None = None) -> dict[str, Any]:
         "api_key_env_set": auth["api_key_env_set"],
         "custom_provider_configured": auth["custom_provider_configured"],
         "model_provider": auth["model_provider"],
+        "default_model": defaults["model"],
+        "default_reasoning_effort": defaults["model_reasoning_effort"],
         "auth_ready": auth["auth_ready"],
         "remediation": auth["remediation"],
         "auth": auth,
@@ -289,6 +316,58 @@ def check_status(cwd: str | None = None) -> dict[str, Any]:
         "git": git_info,
         "danger_sandbox_allowed": os.environ.get("CODEX_BRIDGE_ALLOW_DANGER_SANDBOX") == "1",
     }
+
+
+def _nonneg_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return int(value)
+
+
+def normalize_usage(raw_usage: dict[str, Any] | None) -> dict[str, int] | None:
+    """Normalize token usage counters into non-negative integers with derived total_tokens."""
+    if not isinstance(raw_usage, dict):
+        return None
+
+    fields = (
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    )
+    parsed = {key: _nonneg_int(raw_usage.get(key)) for key in fields}
+    if not any(val is not None for val in parsed.values()):
+        return None
+
+    input_tokens = parsed["input_tokens"] or 0
+    cached_input_tokens = parsed["cached_input_tokens"] or 0
+    output_tokens = parsed["output_tokens"] or 0
+    reasoning_output_tokens = parsed["reasoning_output_tokens"] or 0
+    total_tokens = (
+        parsed["total_tokens"]
+        if parsed["total_tokens"] is not None
+        else (input_tokens + output_tokens)
+    )
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _make_prompt_preview(prompt: str | None, max_len: int = 120) -> str | None:
+    """Collapse whitespace and truncate a prompt preview cleanly."""
+    if not isinstance(prompt, str):
+        return None
+    collapsed = " ".join(prompt.split())
+    if not collapsed:
+        return None
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max_len - 1].rstrip() + "…"
 
 
 def _extract_agent_item_text(item: dict[str, Any]) -> str:
@@ -677,6 +756,15 @@ class _TaskState:
     tmp_dir: tempfile.TemporaryDirectory
     last_msg_path: Path
     baseline: dict[str, Any] | None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    prompt_preview: str | None = None
+    conversation_id: str | None = None
+    activity: str = "starting"
+    live_usage: dict[str, int] | None = None
+    last_persist_monotonic: float = 0.0
+    owner_pid: int | None = None
+    finished_at: float | None = None
     is_resume: bool = False
     session_id: str | None = None
     progress_events: int = 0
@@ -703,6 +791,10 @@ class CodexTaskManager:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self._tasks: dict[str, _TaskState] = {}
         self._registry_lock = threading.Lock()
+        self._session_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}
+        self._cli_status_cache: tuple[float, tuple[str, str], dict[str, Any]] | None = None
+        self._cache_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
 
     def run_plan(
         self,
@@ -711,6 +803,7 @@ class CodexTaskManager:
         model: str | None = None,
         reasoning_effort: str | None = None,
         images: list[str] | None = None,
+        conversation_id: str | None = None,
         wait_seconds: int = DEFAULT_WAIT_SECONDS,
     ) -> dict[str, Any]:
         """Run Codex in strict read-only planning mode and capture session_id for resume."""
@@ -719,9 +812,13 @@ class CodexTaskManager:
         codex_bin = _require_codex_bin()
         clean_model = _normalize_optional_str(model, "model")
         clean_effort = _normalize_optional_str(reasoning_effort, "reasoning_effort")
+        clean_conv_id = _normalize_optional_str(conversation_id, "conversation_id")
         clean_images = _validate_images(images)
         clamped_wait = _clamp_wait_seconds(wait_seconds, default=DEFAULT_WAIT_SECONDS)
         git_info = inspect_git_repo(cwd_path)
+        defaults = read_codex_config_defaults()
+        effective_model = clean_model or defaults["model"]
+        effective_effort = clean_effort or defaults["model_reasoning_effort"]
 
         def build_cmd(last_msg_path: Path) -> list[str]:
             cmd = [
@@ -751,6 +848,10 @@ class CodexTaskManager:
             build_cmd=build_cmd,
             wait_seconds=clamped_wait,
             async_mode=False,
+            model=effective_model,
+            reasoning_effort=effective_effort,
+            prompt_preview=_make_prompt_preview(clean_prompt),
+            conversation_id=clean_conv_id,
         )
 
     def run_exec(
@@ -762,6 +863,7 @@ class CodexTaskManager:
         model: str | None = None,
         reasoning_effort: str | None = None,
         images: list[str] | None = None,
+        conversation_id: str | None = None,
         async_mode: bool = False,
         wait_seconds: int = DEFAULT_WAIT_SECONDS,
     ) -> dict[str, Any]:
@@ -772,8 +874,12 @@ class CodexTaskManager:
         codex_bin = _require_codex_bin()
         clean_model = _normalize_optional_str(model, "model")
         clean_effort = _normalize_optional_str(reasoning_effort, "reasoning_effort")
+        clean_conv_id = _normalize_optional_str(conversation_id, "conversation_id")
         clean_images = _validate_images(images)
         clamped_wait = _clamp_wait_seconds(wait_seconds, default=DEFAULT_WAIT_SECONDS)
+        defaults = read_codex_config_defaults()
+        effective_model = clean_model or defaults["model"]
+        effective_effort = clean_effort or defaults["model_reasoning_effort"]
 
         clean_session_id: str | None = None
         if session_id is not None:
@@ -834,6 +940,10 @@ class CodexTaskManager:
             baseline=baseline,
             is_resume=is_resume,
             initial_session_id=clean_session_id,
+            model=effective_model,
+            reasoning_effort=effective_effort,
+            prompt_preview=_make_prompt_preview(clean_prompt),
+            conversation_id=clean_conv_id,
             extra={"requested_session_id": clean_session_id},
         )
 
@@ -846,6 +956,7 @@ class CodexTaskManager:
         title: str | None = None,
         prompt: str | None = None,
         model: str | None = None,
+        conversation_id: str | None = None,
         wait_seconds: int = DEFAULT_WAIT_SECONDS,
     ) -> dict[str, Any]:
         """Run a read-only Codex code review, routing target+prompt via codex exec."""
@@ -860,6 +971,7 @@ class CodexTaskManager:
         clean_title = _normalize_optional_str(title, "title")
         clean_prompt = _normalize_optional_str(prompt, "prompt")
         clean_model = _normalize_optional_str(model, "model")
+        clean_conv_id = _normalize_optional_str(conversation_id, "conversation_id")
         clamped_wait = _clamp_wait_seconds(wait_seconds, default=DEFAULT_WAIT_SECONDS)
 
         if clean_base and clean_commit:
@@ -951,6 +1063,11 @@ class CodexTaskManager:
                 cmd.append(clean_prompt)
             return cmd
 
+        defaults = read_codex_config_defaults()
+        effective_model = clean_model or defaults["model"]
+        effective_effort = defaults["model_reasoning_effort"]
+        preview_source = clean_prompt or clean_title or f"review ({effective_mode})"
+
         return self._launch_and_wait(
             mode="review",
             cwd_path=cwd_path,
@@ -958,11 +1075,38 @@ class CodexTaskManager:
             build_cmd=build_cmd,
             wait_seconds=clamped_wait,
             async_mode=False,
+            model=effective_model,
+            reasoning_effort=effective_effort,
+            prompt_preview=_make_prompt_preview(preview_source),
+            conversation_id=clean_conv_id,
             extra={
                 "review_mode": effective_mode,
                 "routed_via_exec": routed_via_exec,
             },
         )
+
+    def _reconcile_persisted_task(self, task_path: Path, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Mark persisted running tasks failed if both child pid and owner_pid have exited."""
+        if record.get("status") != "running":
+            return record, False
+        pid = record.get("pid")
+        owner_pid = record.get("owner_pid")
+        pid_dead = pid is not None and not _is_pid_alive(pid)
+        owner_dead = owner_pid is None or not _is_pid_alive(owner_pid)
+        if not (pid_dead and owner_dead):
+            return record, pid_dead
+
+        latest = self._read_persisted_task(task_path)
+        if latest.get("status") != "running":
+            return latest, False
+
+        failed_record = dict(latest)
+        failed_record["status"] = "failed"
+        failed_record["activity"] = "failed"
+        failed_record["finished_at"] = failed_record.get("finished_at") or time.time()
+        failed_record["error"] = "Background task process is no longer running."
+        self._write_task_file(task_path, failed_record)
+        return failed_record, True
 
     def poll_task(self, task_id: str, wait_seconds: int = DEFAULT_POLL_WAIT_SECONDS) -> dict[str, Any]:
         """Poll a background task by ID, waiting up to wait_seconds for completion."""
@@ -985,24 +1129,12 @@ class CodexTaskManager:
         deadline = time.monotonic() + clamped_wait
         while True:
             record = self._read_persisted_task(task_path)
-            if record.get("status") != "running":
-                return record
-            pid = record.get("pid")
-            owner_pid = record.get("owner_pid")
-            pid_dead = pid is not None and not _is_pid_alive(pid)
-            owner_dead = owner_pid is None or not _is_pid_alive(owner_pid)
-            if pid_dead and owner_dead:
-                latest = self._read_persisted_task(task_path)
-                if latest.get("status") != "running":
-                    return latest
-                failed_record = dict(latest)
-                failed_record["status"] = "failed"
-                failed_record["error"] = "Background task process is no longer running."
-                self._write_task_file(task_path, failed_record)
-                return failed_record
+            reconciled, pid_dead = self._reconcile_persisted_task(task_path, record)
+            if reconciled.get("status") != "running":
+                return reconciled
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return record
+                return reconciled
             sleep_step = 0.02 if pid_dead else 0.1
             time.sleep(min(sleep_step, remaining))
 
@@ -1031,6 +1163,87 @@ class CodexTaskManager:
             if task.waiter_thread is not None and task.waiter_thread.is_alive():
                 task.waiter_thread.join(timeout=1.0)
 
+    def _claim_pending_conversation_id(
+        self,
+        *,
+        mode: str,
+        cwd: str,
+        prompt_preview: str | None,
+    ) -> str | None:
+        """Consume the best matching recent PreToolUse correlation record, if any."""
+        pending_path = self.data_dir / "pending_calls.jsonl"
+        with self._pending_lock:
+            if not pending_path.is_file():
+                return None
+            try:
+                raw_lines = pending_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                return None
+
+            now = time.time()
+            fresh: list[dict[str, Any]] = []
+            for line in raw_lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    item = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict) and isinstance(item.get("ts"), (int, float)):
+                    if (now - float(item["ts"])) <= 15.0 and isinstance(
+                        item.get("conversation_id"), str
+                    ):
+                        fresh.append(item)
+
+            if not fresh:
+                try:
+                    pending_path.unlink()
+                except OSError:
+                    pass
+                return None
+
+            matched_idx: int | None = None
+            for idx in range(len(fresh) - 1, -1, -1):
+                entry = fresh[idx]
+                if (
+                    entry.get("cwd") == cwd
+                    and entry.get("mode") == mode
+                    and entry.get("prompt_preview") == prompt_preview
+                ):
+                    matched_idx = idx
+                    break
+            if matched_idx is None:
+                for idx in range(len(fresh) - 1, -1, -1):
+                    entry = fresh[idx]
+                    if entry.get("cwd") == cwd and entry.get("mode") == mode:
+                        matched_idx = idx
+                        break
+            if matched_idx is None:
+                for idx in range(len(fresh) - 1, -1, -1):
+                    entry = fresh[idx]
+                    if entry.get("cwd") == cwd and (now - float(entry["ts"])) <= 5.0:
+                        matched_idx = idx
+                        break
+
+            claimed: str | None = None
+            if matched_idx is not None:
+                claimed = str(fresh.pop(matched_idx)["conversation_id"])
+
+            try:
+                if fresh:
+                    tmp_path = self.data_dir / f".pending_calls.{uuid.uuid4().hex[:8]}.tmp"
+                    tmp_path.write_text(
+                        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in fresh),
+                        encoding="utf-8",
+                    )
+                    os.replace(tmp_path, pending_path)
+                elif pending_path.exists():
+                    pending_path.unlink()
+            except OSError:
+                pass
+            return claimed
+
     def _launch_and_wait(
         self,
         *,
@@ -1043,11 +1256,21 @@ class CodexTaskManager:
         baseline: dict[str, Any] | None = None,
         is_resume: bool = False,
         initial_session_id: str | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        prompt_preview: str | None = None,
+        conversation_id: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         tmp_dir = tempfile.TemporaryDirectory(prefix="codex_bridge_")
         last_msg_path = Path(tmp_dir.name) / "last_message.md"
+        owner_pid = os.getpid()
+        resolved_conv_id = conversation_id or self._claim_pending_conversation_id(
+            mode=mode,
+            cwd=str(cwd_path),
+            prompt_preview=prompt_preview,
+        )
         task = _TaskState(
             task_id=task_id,
             mode=mode,
@@ -1059,6 +1282,12 @@ class CodexTaskManager:
             tmp_dir=tmp_dir,
             last_msg_path=last_msg_path,
             baseline=baseline,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            prompt_preview=prompt_preview,
+            conversation_id=resolved_conv_id,
+            activity="reviewing" if mode == "review" else "thinking",
+            owner_pid=owner_pid,
             is_resume=is_resume,
             session_id=initial_session_id,
         )
@@ -1094,9 +1323,10 @@ class CodexTaskManager:
             initial_record = self._build_running_record(
                 task,
                 pid=proc.pid,
-                owner_pid=os.getpid(),
+                owner_pid=owner_pid,
             )
             self._persist_task_unlocked(task_id, initial_record)
+            task.last_persist_monotonic = time.monotonic()
 
         waiter = threading.Thread(target=self._collect_task, args=(task,), daemon=True)
         task.waiter_thread = waiter
@@ -1108,8 +1338,14 @@ class CodexTaskManager:
                 "task_id": task_id,
                 "mode": mode,
                 "session_id": initial_session_id,
+                "conversation_id": resolved_conv_id,
                 "sandbox": sandbox,
                 "cwd": str(cwd_path),
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "prompt_preview": prompt_preview,
+                "activity": task.activity,
+                "usage": None,
                 "elapsed_ms": 0,
                 "progress_events": 0,
                 "error": None,
@@ -1131,8 +1367,14 @@ class CodexTaskManager:
             "task_id": task.task_id,
             "mode": task.mode,
             "session_id": task.session_id,
+            "conversation_id": task.conversation_id,
             "sandbox": task.sandbox,
             "cwd": task.cwd,
+            "model": task.model,
+            "reasoning_effort": task.reasoning_effort,
+            "prompt_preview": task.prompt_preview,
+            "activity": task.activity,
+            "usage": dict(task.live_usage) if task.live_usage is not None else None,
             "started_at": task.started_at,
             "elapsed_ms": int((time.monotonic() - task.start_monotonic) * 1000),
             "progress_events": task.progress_events,
@@ -1151,6 +1393,23 @@ class CodexTaskManager:
             snapshot = self._build_running_record(task)
             snapshot.pop("started_at", None)
             return snapshot
+
+    @staticmethod
+    def _derive_activity_from_event(event: dict[str, Any], mode: str) -> str | None:
+        event_type = event.get("type")
+        if event_type in ("thread.started", "turn.started"):
+            return "reviewing" if mode == "review" else "thinking"
+        if event_type in ("item.started", "item.updated", "item.completed"):
+            item = event.get("item")
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type == "reasoning":
+                    return "thinking"
+                if item_type in ("command_execution", "file_change", "mcp_tool_call", "web_search"):
+                    return "coding"
+                if item_type == "agent_message":
+                    return "reviewing" if mode == "review" else "coding"
+        return None
 
     def _drain_stdout(self, task: _TaskState) -> None:
         proc = task.proc
@@ -1171,11 +1430,39 @@ class CodexTaskManager:
                     task.stdout_lines.append(line)
                     if parsed_event is not None:
                         task.progress_events += 1
+                        changed = False
                         thread_id = parsed_event.get("thread_id")
                         if isinstance(thread_id, str) and (
                             parsed_event.get("type") == "thread.started" or task.session_id is None
-                        ):
+                        ) and task.session_id != thread_id:
                             task.session_id = thread_id
+                            changed = True
+
+                        next_activity = self._derive_activity_from_event(parsed_event, task.mode)
+                        if next_activity is not None and next_activity != task.activity:
+                            task.activity = next_activity
+                            changed = True
+
+                        if parsed_event.get("type") == "turn.completed" and isinstance(
+                            parsed_event.get("usage"), dict
+                        ):
+                            norm_usage = normalize_usage(parsed_event["usage"])
+                            if norm_usage is not None and norm_usage != task.live_usage:
+                                task.live_usage = norm_usage
+                                changed = True
+
+                        now_mono = time.monotonic()
+                        if changed and (now_mono - task.last_persist_monotonic) >= PERSIST_THROTTLE_SECONDS:
+                            try:
+                                record = self._build_running_record(
+                                    task,
+                                    pid=proc.pid,
+                                    owner_pid=task.owner_pid,
+                                )
+                                self._persist_task_unlocked(task.task_id, record)
+                                task.last_persist_monotonic = now_mono
+                            except OSError:
+                                pass
         finally:
             try:
                 proc.stdout.close()
@@ -1210,6 +1497,7 @@ class CodexTaskManager:
             stderr_thread.join()
 
             elapsed_ms = int((time.monotonic() - task.start_monotonic) * 1000)
+            finished_at = time.time()
 
             with task.lock:
                 stdout_text = "".join(task.stdout_lines)
@@ -1261,14 +1549,22 @@ class CodexTaskManager:
                 Path(task.cwd),
                 task.baseline,
             )
+            final_status = "completed" if returncode == 0 else "failed"
 
             result: dict[str, Any] = {
-                "status": "completed" if returncode == 0 else "failed",
+                "status": final_status,
+                "activity": final_status,
                 "task_id": task.task_id,
                 "mode": task.mode,
                 "session_id": session_id,
+                "conversation_id": task.conversation_id,
                 "sandbox": task.sandbox,
                 "cwd": task.cwd,
+                "model": task.model,
+                "reasoning_effort": task.reasoning_effort,
+                "prompt_preview": task.prompt_preview,
+                "started_at": task.started_at,
+                "finished_at": finished_at,
                 "summary": summary,
                 "usage": parsed["usage"],
                 "events_count": parsed["events_count"],
@@ -1287,18 +1583,28 @@ class CodexTaskManager:
             )
 
             with task.lock:
+                task.activity = final_status
+                task.finished_at = finished_at
                 task.result = result
                 task.session_id = session_id
                 self._persist_task_unlocked(task.task_id, result)
         except Exception as exc:
             elapsed_ms = int((time.monotonic() - task.start_monotonic) * 1000)
+            finished_at = time.time()
             fallback: dict[str, Any] = {
                 "status": "failed",
+                "activity": "failed",
                 "task_id": task.task_id,
                 "mode": task.mode,
                 "session_id": task.session_id,
+                "conversation_id": task.conversation_id,
                 "sandbox": task.sandbox,
                 "cwd": task.cwd,
+                "model": task.model,
+                "reasoning_effort": task.reasoning_effort,
+                "prompt_preview": task.prompt_preview,
+                "started_at": task.started_at,
+                "finished_at": finished_at,
                 "summary": f"Internal runner error: {exc}",
                 "usage": None,
                 "events_count": task.progress_events,
@@ -1318,6 +1624,8 @@ class CodexTaskManager:
             with task.lock:
                 task.stdout_lines.clear()
                 task.stderr_lines.clear()
+                task.activity = "failed"
+                task.finished_at = finished_at
                 task.result = fallback
                 self._persist_task_unlocked(task.task_id, fallback)
         finally:
@@ -1378,3 +1686,478 @@ class CodexTaskManager:
         if not isinstance(data, dict):
             raise CodexRunnerError(f"Corrupted task state {task_path.name}")
         return data
+
+    def _get_cached_cli_status(self, ttl: float = CLI_STATUS_CACHE_TTL_SECONDS) -> dict[str, Any]:
+        cache_key = (
+            os.environ.get("CODEX_BIN", "").strip(),
+            os.environ.get("CODEX_HOME", "").strip(),
+        )
+        now = time.monotonic()
+        with self._cache_lock:
+            if self._cli_status_cache is not None:
+                cached_at, cached_key, cached_val = self._cli_status_cache
+                if cached_key == cache_key and (now - cached_at) < ttl:
+                    return dict(cached_val)
+
+        fresh = check_status()
+        with self._cache_lock:
+            self._cli_status_cache = (time.monotonic(), cache_key, fresh)
+        return dict(fresh)
+
+    @staticmethod
+    def _parse_iso_timestamp(value: Any) -> float | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(normalized).timestamp()
+        except ValueError:
+            return None
+
+    def _parse_cli_session_file(self, path: Path, mtime_ns: int, size: int) -> dict[str, Any] | None:
+        cache_key = str(path)
+        with self._cache_lock:
+            cached = self._session_cache.get(cache_key)
+            if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+                return dict(cached[2])
+
+        session_id: str | None = None
+        cwd: str | None = None
+        model: str | None = None
+        effort: str | None = None
+        usage: dict[str, int] | None = None
+        started_at: float | None = None
+        last_activity = "thinking"
+        finished_turn = False
+        events_count = 0
+
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for raw_line in fh:
+                    if (
+                        '"session_meta"' not in raw_line
+                        and '"turn_context"' not in raw_line
+                        and '"event_msg"' not in raw_line
+                        and '"response_item"' not in raw_line
+                    ):
+                        continue
+                    try:
+                        event = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+
+                    events_count += 1
+                    ev_type = event.get("type")
+                    payload = event.get("payload")
+                    if not isinstance(payload, dict):
+                        payload = {}
+
+                    if ev_type == "session_meta":
+                        if isinstance(payload.get("id"), str) and payload["id"].strip():
+                            session_id = payload["id"].strip()
+                        if isinstance(payload.get("cwd"), str) and payload["cwd"].strip():
+                            cwd = payload["cwd"].strip()
+                        ts = self._parse_iso_timestamp(payload.get("timestamp")) or self._parse_iso_timestamp(
+                            event.get("timestamp")
+                        )
+                        if ts is not None and started_at is None:
+                            started_at = ts
+                    elif ev_type == "turn_context":
+                        if isinstance(payload.get("model"), str) and payload["model"].strip():
+                            model = payload["model"].strip()
+                        if isinstance(payload.get("effort"), str) and payload["effort"].strip():
+                            effort = payload["effort"].strip()
+                        last_activity = "thinking"
+                        finished_turn = False
+                    elif ev_type == "event_msg":
+                        p_type = payload.get("type")
+                        if p_type == "token_count":
+                            info = payload.get("info")
+                            if isinstance(info, dict):
+                                norm = normalize_usage(info.get("total_token_usage"))
+                                if norm is not None:
+                                    usage = norm
+                        elif p_type == "task_started":
+                            last_activity = "thinking"
+                            finished_turn = False
+                        elif p_type in ("task_complete", "turn_aborted"):
+                            last_activity = "completed"
+                            finished_turn = True
+                    elif ev_type == "response_item":
+                        p_type = payload.get("type")
+                        if p_type == "reasoning":
+                            last_activity = "thinking"
+                        elif p_type in ("function_call", "custom_tool_call", "local_shell_call", "message"):
+                            last_activity = "coding"
+        except OSError:
+            return None
+
+        if not session_id:
+            session_id = path.stem
+
+        parsed_meta = {
+            "session_id": session_id,
+            "cwd": cwd,
+            "model": model,
+            "reasoning_effort": effort,
+            "usage": usage,
+            "started_at": started_at,
+            "last_activity": last_activity,
+            "finished_turn": finished_turn,
+            "events_count": events_count,
+        }
+        with self._cache_lock:
+            if len(self._session_cache) >= MAX_CLI_SESSION_FILES * 2:
+                self._session_cache.clear()
+            self._session_cache[cache_key] = (mtime_ns, size, parsed_meta)
+        return dict(parsed_meta)
+
+    def _scan_cli_sessions(self) -> list[dict[str, Any]]:
+        sessions_dir = _get_codex_home_dir() / "sessions"
+        if not sessions_dir.is_dir():
+            return []
+
+        candidates: list[tuple[int, int, float, Path]] = []
+        try:
+            for root, _dirs, files in os.walk(sessions_dir):
+                for fname in files:
+                    if not fname.endswith(".jsonl"):
+                        continue
+                    fpath = Path(root) / fname
+                    try:
+                        st = fpath.stat()
+                    except OSError:
+                        continue
+                    candidates.append((st.st_mtime_ns, st.st_size, st.st_mtime, fpath))
+        except OSError:
+            return []
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        now = time.time()
+        sessions: list[dict[str, Any]] = []
+        for mtime_ns, size, mtime_sec, fpath in candidates[:MAX_CLI_SESSION_FILES]:
+            parsed = self._parse_cli_session_file(fpath, mtime_ns, size)
+            if parsed is None:
+                continue
+            started_at = parsed["started_at"] or mtime_sec
+            is_running = (not parsed["finished_turn"]) and (now - mtime_sec) <= CLI_SESSION_ACTIVE_WINDOW_SECONDS
+            status = "running" if is_running else "completed"
+            activity = parsed["last_activity"] if is_running else "completed"
+            end_sec = now if is_running else mtime_sec
+            elapsed_ms = max(0, int((end_sec - started_at) * 1000))
+            sessions.append(
+                {
+                    "worker_id": f"cli:{parsed['session_id']}",
+                    "source": "cli",
+                    "task_id": None,
+                    "session_id": parsed["session_id"],
+                    "mode": "cli",
+                    "sandbox": None,
+                    "cwd": parsed["cwd"],
+                    "model": parsed["model"],
+                    "reasoning_effort": parsed["reasoning_effort"],
+                    "status": status,
+                    "activity": activity,
+                    "usage": parsed["usage"],
+                    "changed_files": [],
+                    "changed_files_count": 0,
+                    "started_at": started_at,
+                    "finished_at": None if is_running else mtime_sec,
+                    "elapsed_ms": elapsed_ms,
+                    "progress_events": parsed["events_count"],
+                    "prompt_preview": None,
+                    "error": None,
+                }
+            )
+        return sessions
+
+    @staticmethod
+    def _worker_from_bridge_record(record: dict[str, Any]) -> dict[str, Any]:
+        status = record.get("status")
+        if status not in ("running", "completed", "failed"):
+            status = "completed"
+        mode = record.get("mode") or "exec"
+        activity = record.get("activity")
+        if not isinstance(activity, str) or not activity:
+            if status == "running":
+                activity = "reviewing" if mode == "review" else "thinking"
+            else:
+                activity = status
+
+        changed_files = record.get("changed_files")
+        if not isinstance(changed_files, list):
+            changed_files = []
+        clean_changed = [str(item) for item in changed_files]
+
+        elapsed_raw = record.get("elapsed_ms")
+        elapsed_ms = int(elapsed_raw) if isinstance(elapsed_raw, (int, float)) and not isinstance(elapsed_raw, bool) and elapsed_raw >= 0 else 0
+        progress_raw = record.get("progress_events")
+        if not isinstance(progress_raw, int):
+            progress_raw = record.get("events_count")
+        progress_events = int(progress_raw) if isinstance(progress_raw, int) and not isinstance(progress_raw, bool) and progress_raw >= 0 else 0
+
+        return {
+            "worker_id": str(record.get("task_id") or f"bridge:{uuid.uuid4().hex[:8]}"),
+            "source": "bridge",
+            "task_id": record.get("task_id"),
+            "session_id": record.get("session_id"),
+            "conversation_id": record.get("conversation_id"),
+            "mode": mode,
+            "sandbox": record.get("sandbox"),
+            "cwd": record.get("cwd"),
+            "model": record.get("model"),
+            "reasoning_effort": record.get("reasoning_effort"),
+            "status": status,
+            "activity": activity,
+            "usage": normalize_usage(record.get("usage")),
+            "changed_files": clean_changed,
+            "changed_files_count": len(clean_changed),
+            "started_at": record.get("started_at"),
+            "finished_at": record.get("finished_at"),
+            "elapsed_ms": elapsed_ms,
+            "progress_events": progress_events,
+            "prompt_preview": record.get("prompt_preview"),
+            "error": record.get("error"),
+        }
+
+    def _collect_bridge_workers(self) -> list[dict[str, Any]]:
+        records_by_id: dict[str, dict[str, Any]] = {}
+
+        if self.tasks_dir.is_dir():
+            for task_path in self.tasks_dir.glob("task_*.json"):
+                try:
+                    raw = self._read_persisted_task(task_path)
+                    reconciled, _ = self._reconcile_persisted_task(task_path, raw)
+                except CodexRunnerError:
+                    continue
+                task_id = reconciled.get("task_id") or task_path.stem
+                records_by_id[str(task_id)] = reconciled
+
+        with self._registry_lock:
+            live_tasks = list(self._tasks.values())
+
+        for task in live_tasks:
+            with task.lock:
+                if task.result is not None:
+                    live_rec = dict(task.result)
+                else:
+                    live_rec = self._build_running_record(
+                        task,
+                        pid=task.proc.pid if task.proc is not None else None,
+                        owner_pid=task.owner_pid,
+                    )
+            records_by_id[task.task_id] = live_rec
+
+        return [self._worker_from_bridge_record(rec) for rec in records_by_id.values()]
+
+    @staticmethod
+    def _aggregate_worker_stats(workers: list[dict[str, Any]]) -> dict[str, Any]:
+        total_workers = len(workers)
+        running_count = 0
+        completed_count = 0
+        failed_count = 0
+        bridge_count = 0
+        cli_count = 0
+
+        input_tokens = 0
+        cached_input_tokens = 0
+        output_tokens = 0
+        reasoning_output_tokens = 0
+        total_tokens = 0
+        total_elapsed_ms = 0
+        total_changed_files = 0
+
+        by_model_map: dict[str, dict[str, Any]] = {}
+        by_effort_map: dict[str, dict[str, Any]] = {}
+        by_mode_map: dict[str, dict[str, Any]] = {}
+
+        for worker in workers:
+            status = worker.get("status")
+            if status == "running":
+                running_count += 1
+            elif status == "failed":
+                failed_count += 1
+            else:
+                completed_count += 1
+
+            if worker.get("source") == "cli":
+                cli_count += 1
+            else:
+                bridge_count += 1
+
+            usage = worker.get("usage") or {}
+            w_total = int(usage.get("total_tokens") or 0)
+            input_tokens += int(usage.get("input_tokens") or 0)
+            cached_input_tokens += int(usage.get("cached_input_tokens") or 0)
+            output_tokens += int(usage.get("output_tokens") or 0)
+            reasoning_output_tokens += int(usage.get("reasoning_output_tokens") or 0)
+            total_tokens += w_total
+
+            total_elapsed_ms += int(worker.get("elapsed_ms") or 0)
+            total_changed_files += int(worker.get("changed_files_count") or 0)
+
+            model_key = worker.get("model") or "unknown"
+            m_entry = by_model_map.setdefault(
+                model_key,
+                {"model": model_key, "count": 0, "running": 0, "total_tokens": 0},
+            )
+            m_entry["count"] += 1
+            if status == "running":
+                m_entry["running"] += 1
+            m_entry["total_tokens"] += w_total
+
+            effort_key = worker.get("reasoning_effort") or "default"
+            e_entry = by_effort_map.setdefault(
+                effort_key,
+                {"effort": effort_key, "count": 0, "total_tokens": 0},
+            )
+            e_entry["count"] += 1
+            e_entry["total_tokens"] += w_total
+
+            mode_key = worker.get("mode") or "exec"
+            mode_entry = by_mode_map.setdefault(
+                mode_key,
+                {"mode": mode_key, "count": 0, "total_tokens": 0},
+            )
+            mode_entry["count"] += 1
+            mode_entry["total_tokens"] += w_total
+
+        finished_count = completed_count + failed_count
+        cache_hit_rate = round(cached_input_tokens / input_tokens, 4) if input_tokens > 0 else 0.0
+        success_rate = round(completed_count / finished_count, 4) if finished_count > 0 else 0.0
+        avg_elapsed_ms = int(total_elapsed_ms / total_workers) if total_workers > 0 else 0
+
+        by_model = sorted(
+            by_model_map.values(),
+            key=lambda x: (-x["running"], -x["total_tokens"], -x["count"], x["model"]),
+        )
+        by_effort = sorted(
+            by_effort_map.values(),
+            key=lambda x: (-x["count"], -x["total_tokens"], x["effort"]),
+        )
+        by_mode = sorted(
+            by_mode_map.values(),
+            key=lambda x: (-x["count"], -x["total_tokens"], x["mode"]),
+        )
+
+        return {
+            "total_workers": total_workers,
+            "running_count": running_count,
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "bridge_count": bridge_count,
+            "cli_count": cli_count,
+            "tokens": {
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached_input_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_output_tokens": reasoning_output_tokens,
+                "total_tokens": total_tokens,
+                "cache_hit_rate": cache_hit_rate,
+            },
+            "total_elapsed_ms": total_elapsed_ms,
+            "avg_elapsed_ms": avg_elapsed_ms,
+            "total_changed_files": total_changed_files,
+            "success_rate": success_rate,
+            "by_model": by_model,
+            "by_effort": by_effort,
+            "by_mode": by_mode,
+        }
+
+    def get_dashboard_snapshot(
+        self,
+        *,
+        include_cli_sessions: bool = False,
+        conversation_id: str | None = None,
+        limit: int = DEFAULT_DASHBOARD_LIMIT,
+    ) -> dict[str, Any]:
+        """Collect Antigravity-invoked Codex worker status and aggregated work statistics."""
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise CodexRunnerError("limit must be an integer.")
+        clamped_limit = max(1, min(limit, MAX_DASHBOARD_LIMIT))
+        clean_conv_id = _normalize_optional_str(conversation_id, "conversation_id")
+
+        cli_status = self._get_cached_cli_status()
+        bridge_workers = self._collect_bridge_workers()
+        if clean_conv_id is not None:
+            bridge_workers = [
+                w for w in bridge_workers if w.get("conversation_id") == clean_conv_id
+            ]
+
+        by_session_id: dict[str, dict[str, Any]] = {}
+        needs_hydration = False
+        for worker in bridge_workers:
+            sid = worker.get("session_id")
+            if isinstance(sid, str) and sid:
+                by_session_id[sid] = worker
+                if not worker.get("model") or not worker.get("reasoning_effort") or worker.get("usage") is None:
+                    needs_hydration = True
+
+        workers: list[dict[str, Any]] = list(bridge_workers)
+        if include_cli_sessions or needs_hydration:
+            for cli_worker in self._scan_cli_sessions():
+                sid = cli_worker.get("session_id")
+                existing = by_session_id.get(sid) if isinstance(sid, str) else None
+                if existing is not None:
+                    if not existing.get("model") and cli_worker.get("model"):
+                        existing["model"] = cli_worker["model"]
+                    if not existing.get("reasoning_effort") and cli_worker.get("reasoning_effort"):
+                        existing["reasoning_effort"] = cli_worker["reasoning_effort"]
+                    if cli_worker.get("usage") is not None and existing.get("usage") is None:
+                        existing["usage"] = cli_worker["usage"]
+                    continue
+                if include_cli_sessions and clean_conv_id is None:
+                    workers.append(cli_worker)
+
+        workers.sort(
+            key=lambda w: (
+                0 if w.get("status") == "running" else 1,
+                -(float(w.get("finished_at") or w.get("started_at") or 0.0)),
+                str(w.get("worker_id") or ""),
+            )
+        )
+
+        stats = self._aggregate_worker_stats(workers)
+        return {
+            "generated_at": time.time(),
+            "conversation_id": clean_conv_id,
+            "cli_status": cli_status,
+            "stats": stats,
+            "workers": workers[:clamped_limit],
+        }
+
+    def clear_finished_tasks(self, conversation_id: str | None = None) -> int:
+        """Delete persisted and in-memory completed/failed bridge task records while keeping running tasks."""
+        clean_conv_id = _normalize_optional_str(conversation_id, "conversation_id")
+        removed = 0
+        with self._registry_lock:
+            done_ids = [
+                task_id
+                for task_id, task in self._tasks.items()
+                if task.done_event.is_set()
+                and (clean_conv_id is None or task.conversation_id == clean_conv_id)
+            ]
+            for task_id in done_ids:
+                self._tasks.pop(task_id, None)
+
+        if self.tasks_dir.is_dir():
+            for task_path in list(self.tasks_dir.glob("task_*.json")):
+                try:
+                    raw = self._read_persisted_task(task_path)
+                    reconciled, _ = self._reconcile_persisted_task(task_path, raw)
+                except CodexRunnerError:
+                    continue
+                if reconciled.get("status") == "running":
+                    continue
+                if clean_conv_id is not None and reconciled.get("conversation_id") != clean_conv_id:
+                    continue
+                try:
+                    task_path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        return removed

@@ -153,6 +153,8 @@ class TestMcpServer(unittest.TestCase):
                 by_name["codex_run"]["inputSchema"]["properties"]["sandbox"]["enum"],
                 ["workspace-write", "read-only"],
             )
+            for tool_name in ("codex_plan", "codex_run", "codex_review"):
+                self.assertIn("conversation_id", by_name[tool_name]["inputSchema"]["properties"])
         finally:
             rc, _ = client.close()
         self.assertEqual(rc, 0)
@@ -505,6 +507,72 @@ class TestMcpServer(unittest.TestCase):
                 client.proc.stdout.close()
             if client.proc.stderr and not client.proc.stderr.closed:
                 client.proc.stderr.close()
+
+    def test_concurrent_tools_call_and_conversation_id_persistence(self) -> None:
+        client = _McpClient(
+            self.data_dir,
+            extra_env={"FAKE_CODEX_SLEEP": "0.4"},
+        )
+        try:
+            client.request("initialize", {"protocolVersion": "2025-03-26"})
+            client.send_notification("notifications/initialized")
+
+            # Verify MCP resources are no longer exposed (Sidecar replaces MCP App)
+            res_list = client.request("resources/list")
+            self.assertEqual(res_list["error"]["code"], -32601)
+
+            assert client.proc.stdin is not None
+            assert client.proc.stdout is not None
+
+            started = time.monotonic()
+            for req_id, conv_id, prompt in (
+                (201, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Task A"),
+                (202, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "Task B"),
+            ):
+                client.proc.stdin.write(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "codex_run",
+                                "arguments": {
+                                    "prompt": prompt,
+                                    "cwd": str(self.workdir),
+                                    "conversation_id": conv_id,
+                                    "async_mode": False,
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            client.proc.stdin.flush()
+
+            responses: dict[int, dict[str, Any]] = {}
+            while len(responses) < 2:
+                line = client.proc.stdout.readline()
+                self.assertTrue(line)
+                msg = json.loads(line)
+                responses[msg["id"]] = msg
+
+            elapsed = time.monotonic() - started
+            # Running both 0.4s tasks concurrently finishes in well under 0.8s (serial would be >= 0.8s)
+            self.assertLess(elapsed, 0.78)
+
+            payload_a = json.loads(responses[201]["result"]["content"][0]["text"])
+            payload_b = json.loads(responses[202]["result"]["content"][0]["text"])
+            self.assertEqual(payload_a["conversation_id"], "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+            self.assertEqual(payload_b["conversation_id"], "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+            task_a_disk = json.loads((self.data_dir / "tasks" / f"{payload_a['task_id']}.json").read_text("utf-8"))
+            task_b_disk = json.loads((self.data_dir / "tasks" / f"{payload_b['task_id']}.json").read_text("utf-8"))
+            self.assertEqual(task_a_disk["conversation_id"], "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+            self.assertEqual(task_b_disk["conversation_id"], "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        finally:
+            rc, _ = client.close()
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":
