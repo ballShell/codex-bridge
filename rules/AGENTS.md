@@ -31,8 +31,13 @@ Never forward vague user messages (e.g., `"make auth cleaner"`) verbatim to Code
 2. **Target `cwd` & Key Paths/Symbols:** Workspace root plus relevant files, modules, or symbols already identified.
 3. **Constraints & Conventions:** Stack/library rules, compatibility requirements, and edge cases clarified with the user.
 4. **Acceptance & Verification Criteria:** Concrete checks, tests, or commands Codex should run to prove the work.
+5. **Duration Budget Estimation (`max_duration_seconds` & optional `max_idle_seconds`):** Always estimate and pass a realistic `max_duration_seconds` on every `codex_plan`, `codex_run`, and `codex_review` call (`codex-bridge` enforces a hard process-group timeout on all calls, and automatically injects an ~80% soft prompt budget on `codex_plan`, `codex_run`, and prompt-bearing `codex_review`; prompt-less native `codex_review` receives the hard watchdog only):
+   - Small diff review / quick Q&A (≤5 files): `max_duration_seconds=180..300`, `max_idle_seconds=120..180`
+   - Medium plan / single-module edit: `max_duration_seconds=300..600`, `max_idle_seconds=180..300`
+   - Heavy architecture / multi-file refactor: `max_duration_seconds=600..1200`, `max_idle_seconds=300..420`
 
 ## 5. MCP Tools & Post-Run Verification
 
 - **Server `codex-bridge_codex`:** Eager tool `codex_status`; lazy tools `codex_plan`, `codex_run`, `codex_review`, `codex_poll` invoked via `call_mcp_tool(ServerName="codex-bridge_codex", ToolName="<tool>", Arguments={...})` (keeps heavy schemas out of Antigravity's eager-tool budget so they are never silently dropped). Whenever any call returns `status == "running"`, poll with `codex_poll(task_id=...)` until completion.
+- **Timeout Handling (`timed_out: true`):** If a task is terminated by `max_duration` or `max_idle`, inspect any partial `summary`, `changed_files`, and `session_id`, report progress clearly to the user, and offer to resume via `codex_run(session_id=...)` or narrow the scope with an adjusted budget.
 - **Mandatory Post-Run Translation:** After `codex_run`, inspect `changed_files`, `pre_existing_dirty_files` (never misattribute pre-existing dirty files to Codex), and `diff_stat`. Read key touched files and run quick sanity checks if verification is incomplete, then report in the user's language: **what changed, why, verification evidence, and any open choices or risks**.

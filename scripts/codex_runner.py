@@ -26,6 +26,12 @@ PREFLIGHT_TIMEOUT_SECONDS = 5
 DEFAULT_WAIT_SECONDS = 120
 DEFAULT_POLL_WAIT_SECONDS = 30
 MAX_WAIT_SECONDS = 600
+DEFAULT_MAX_DURATION_SECONDS = 900
+MIN_DURATION_SECONDS = 1
+MAX_DURATION_SECONDS = 3600
+SOFT_BUDGET_RATIO = 0.8
+WATCHDOG_POLL_INTERVAL_SECONDS = 0.25
+HARD_KILL_GRACE_SECONDS = 2.0
 MAX_FINGERPRINT_BYTES = 5 * 1024 * 1024
 CLI_STATUS_CACHE_TTL_SECONDS = 30.0
 PERSIST_THROTTLE_SECONDS = 0.8
@@ -730,6 +736,133 @@ def _build_review_fallback_prompt(
     return "\n".join(lines)
 
 
+def _validate_duration_constraints(
+    max_duration_seconds: int | None,
+    max_idle_seconds: int | None,
+) -> tuple[int, int | None, int]:
+    """Validate hard duration and optional idle stall budgets and compute soft target seconds."""
+    if max_duration_seconds is None:
+        effective_max = DEFAULT_MAX_DURATION_SECONDS
+    else:
+        if isinstance(max_duration_seconds, bool) or not isinstance(max_duration_seconds, int):
+            raise CodexRunnerError("max_duration_seconds must be an integer.")
+        if max_duration_seconds < MIN_DURATION_SECONDS or max_duration_seconds > MAX_DURATION_SECONDS:
+            raise CodexRunnerError(
+                f"max_duration_seconds must be between {MIN_DURATION_SECONDS} and {MAX_DURATION_SECONDS}."
+            )
+        effective_max = max_duration_seconds
+
+    effective_idle: int | None = None
+    if max_idle_seconds is not None:
+        if isinstance(max_idle_seconds, bool) or not isinstance(max_idle_seconds, int):
+            raise CodexRunnerError("max_idle_seconds must be an integer.")
+        if max_idle_seconds < MIN_DURATION_SECONDS or max_idle_seconds > MAX_DURATION_SECONDS:
+            raise CodexRunnerError(
+                f"max_idle_seconds must be between {MIN_DURATION_SECONDS} and {MAX_DURATION_SECONDS}."
+            )
+        effective_idle = min(max_idle_seconds, effective_max)
+
+    soft_target = max(1, int(effective_max * SOFT_BUDGET_RATIO))
+    if effective_max > 1 and soft_target >= effective_max:
+        soft_target = effective_max - 1
+    return effective_max, effective_idle, soft_target
+
+
+def _inject_time_budget_prompt(
+    prompt: str,
+    *,
+    max_duration_seconds: int,
+    soft_budget_seconds: int,
+    max_idle_seconds: int | None,
+) -> str:
+    """Append a standardized soft time-budget directive to the Codex prompt."""
+    lines = [
+        prompt.rstrip(),
+        "",
+        "[Execution Time Budget — Soft Constraint]",
+        f"- Hard time limit: {max_duration_seconds}s (the runner will automatically terminate this process if exceeded).",
+        f"- Target completion: wrap up and output your final response within ~{soft_budget_seconds}s.",
+        "- Budget discipline: prioritize the highest-impact analysis/changes first, avoid broad exploratory scans outside scope, keep verification focused, and if approaching the limit, stop exploring immediately and deliver a concise summary of completed work and remaining items.",
+    ]
+    if max_idle_seconds is not None:
+        lines.append(
+            f"- Idle stall limit: {max_idle_seconds}s without progress events will terminate the run; keep each step focused."
+        )
+    return "\n".join(lines)
+
+
+def _is_pgid_alive(pgid: int) -> bool:
+    if pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) -> bool:
+    """Terminate a child process group cleanly (SIGTERM -> brief grace -> SIGKILL).
+
+    Returns True if a signal was actually delivered to a live process or process group
+    (including surviving descendants after leader exit), False if already gone.
+    """
+    pgid = proc.pid
+    signaled = False
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        signaled = True
+    except ProcessLookupError:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                signaled = True
+            except OSError:
+                pass
+    except OSError:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                signaled = True
+            except OSError:
+                pass
+
+    if not signaled and proc.poll() is not None and not _is_pgid_alive(pgid):
+        return False
+
+    deadline = time.monotonic() + max(0.1, grace_seconds)
+    while time.monotonic() < deadline:
+        if proc.poll() is not None and not _is_pgid_alive(pgid):
+            return signaled
+        time.sleep(0.05)
+
+    if proc.poll() is None or _is_pgid_alive(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            signaled = True
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                signaled = True
+            except OSError:
+                pass
+        kill_deadline = time.monotonic() + 0.5
+        while time.monotonic() < kill_deadline:
+            if proc.poll() is not None and not _is_pgid_alive(pgid):
+                break
+            time.sleep(0.05)
+
+    return signaled
+
+
 def _is_pid_alive(pid: Any) -> bool:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return False
@@ -767,6 +900,17 @@ class _TaskState:
     last_persist_monotonic: float = 0.0
     persist_dirty: bool = False
     persist_timer: threading.Timer | None = None
+    max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS
+    max_idle_seconds: int | None = None
+    soft_budget_seconds: int = int(DEFAULT_MAX_DURATION_SECONDS * SOFT_BUDGET_RATIO)
+    soft_budget_injected: bool = False
+    timed_out: bool = False
+    timeout_enforced: bool = False
+    timeout_reason: str | None = None
+    timeout_detail: str | None = None
+    watchdog_stop: threading.Event = field(default_factory=threading.Event)
+    watchdog_done: threading.Event = field(default_factory=threading.Event)
+    watchdog_thread: threading.Thread | None = None
     owner_pid: int | None = None
     finished_at: float | None = None
     is_resume: bool = False
@@ -809,6 +953,8 @@ class CodexTaskManager:
         images: list[str] | None = None,
         conversation_id: str | None = None,
         wait_seconds: int = DEFAULT_WAIT_SECONDS,
+        max_duration_seconds: int | None = None,
+        max_idle_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Run Codex in strict read-only planning mode and capture session_id for resume."""
         clean_prompt = _require_non_empty_str(prompt, "prompt")
@@ -819,6 +965,15 @@ class CodexTaskManager:
         clean_conv_id = _normalize_optional_str(conversation_id, "conversation_id")
         clean_images = _validate_images(images)
         clamped_wait = _clamp_wait_seconds(wait_seconds, default=DEFAULT_WAIT_SECONDS)
+        effective_max, effective_idle, soft_budget = _validate_duration_constraints(
+            max_duration_seconds, max_idle_seconds
+        )
+        budgeted_prompt = _inject_time_budget_prompt(
+            clean_prompt,
+            max_duration_seconds=effective_max,
+            soft_budget_seconds=soft_budget,
+            max_idle_seconds=effective_idle,
+        )
         git_info = inspect_git_repo(cwd_path)
         defaults = read_codex_config_defaults()
         effective_model = clean_model or defaults["model"]
@@ -842,7 +997,7 @@ class CodexTaskManager:
                 model=clean_model,
                 reasoning_effort=clean_effort,
                 images=clean_images,
-                prompt=clean_prompt,
+                prompt=budgeted_prompt,
             )
 
         return self._launch_and_wait(
@@ -856,6 +1011,10 @@ class CodexTaskManager:
             reasoning_effort=effective_effort,
             prompt_preview=_make_prompt_preview(clean_prompt),
             conversation_id=clean_conv_id,
+            max_duration_seconds=effective_max,
+            max_idle_seconds=effective_idle,
+            soft_budget_seconds=soft_budget,
+            soft_budget_injected=True,
         )
 
     def run_exec(
@@ -870,6 +1029,8 @@ class CodexTaskManager:
         conversation_id: str | None = None,
         async_mode: bool = False,
         wait_seconds: int = DEFAULT_WAIT_SECONDS,
+        max_duration_seconds: int | None = None,
+        max_idle_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Run a fresh or resumed Codex execution task with sandbox and Git delta tracking."""
         clean_prompt = _require_non_empty_str(prompt, "prompt")
@@ -881,6 +1042,15 @@ class CodexTaskManager:
         clean_conv_id = _normalize_optional_str(conversation_id, "conversation_id")
         clean_images = _validate_images(images)
         clamped_wait = _clamp_wait_seconds(wait_seconds, default=DEFAULT_WAIT_SECONDS)
+        effective_max, effective_idle, soft_budget = _validate_duration_constraints(
+            max_duration_seconds, max_idle_seconds
+        )
+        budgeted_prompt = _inject_time_budget_prompt(
+            clean_prompt,
+            max_duration_seconds=effective_max,
+            soft_budget_seconds=soft_budget,
+            max_idle_seconds=effective_idle,
+        )
         defaults = read_codex_config_defaults()
         effective_model = clean_model or defaults["model"]
         effective_effort = clean_effort or defaults["model_reasoning_effort"]
@@ -931,7 +1101,7 @@ class CodexTaskManager:
                 model=clean_model,
                 reasoning_effort=clean_effort,
                 images=clean_images,
-                prompt=clean_prompt,
+                prompt=budgeted_prompt,
             )
 
         return self._launch_and_wait(
@@ -948,6 +1118,10 @@ class CodexTaskManager:
             reasoning_effort=effective_effort,
             prompt_preview=_make_prompt_preview(clean_prompt),
             conversation_id=clean_conv_id,
+            max_duration_seconds=effective_max,
+            max_idle_seconds=effective_idle,
+            soft_budget_seconds=soft_budget,
+            soft_budget_injected=True,
             extra={"requested_session_id": clean_session_id},
         )
 
@@ -960,8 +1134,11 @@ class CodexTaskManager:
         title: str | None = None,
         prompt: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         conversation_id: str | None = None,
         wait_seconds: int = DEFAULT_WAIT_SECONDS,
+        max_duration_seconds: int | None = None,
+        max_idle_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Run a read-only Codex code review, routing target+prompt via codex exec."""
         if mode not in VALID_REVIEW_MODES:
@@ -975,8 +1152,12 @@ class CodexTaskManager:
         clean_title = _normalize_optional_str(title, "title")
         clean_prompt = _normalize_optional_str(prompt, "prompt")
         clean_model = _normalize_optional_str(model, "model")
+        clean_effort = _normalize_optional_str(reasoning_effort, "reasoning_effort")
         clean_conv_id = _normalize_optional_str(conversation_id, "conversation_id")
         clamped_wait = _clamp_wait_seconds(wait_seconds, default=DEFAULT_WAIT_SECONDS)
+        effective_max, effective_idle, soft_budget = _validate_duration_constraints(
+            max_duration_seconds, max_idle_seconds
+        )
 
         if clean_base and clean_commit:
             raise CodexRunnerError("Specify at most one of base_branch or commit_sha.")
@@ -1004,6 +1185,7 @@ class CodexTaskManager:
 
         git_info = inspect_git_repo(cwd_path)
         routed_via_exec = effective_mode in ("uncommitted", "base", "commit") and clean_prompt is not None
+        soft_injected = routed_via_exec or effective_mode == "custom"
 
         def build_cmd(last_msg_path: Path) -> list[str]:
             if routed_via_exec:
@@ -1014,6 +1196,12 @@ class CodexTaskManager:
                     base_branch=clean_base,
                     commit_sha=clean_commit,
                     title=clean_title,
+                )
+                budgeted_review_prompt = _inject_time_budget_prompt(
+                    review_prompt,
+                    max_duration_seconds=effective_max,
+                    soft_budget_seconds=soft_budget,
+                    max_idle_seconds=effective_idle,
                 )
                 cmd = [
                     codex_bin,
@@ -1030,9 +1218,11 @@ class CodexTaskManager:
                     cmd.append("--skip-git-repo-check")
                 if clean_model:
                     cmd.extend(["-m", clean_model])
-                if review_prompt.startswith("-"):
+                if clean_effort:
+                    cmd.extend(["-c", f"model_reasoning_effort={json.dumps(clean_effort)}"])
+                if budgeted_review_prompt.startswith("-"):
                     cmd.append("--")
-                cmd.append(review_prompt)
+                cmd.append(budgeted_review_prompt)
                 return cmd
 
             cmd = [
@@ -1049,6 +1239,8 @@ class CodexTaskManager:
                 cmd.append("--skip-git-repo-check")
             if clean_model:
                 cmd.extend(["-m", clean_model])
+            if clean_effort:
+                cmd.extend(["-c", f"model_reasoning_effort={json.dumps(clean_effort)}"])
             if clean_title:
                 cmd.extend(["--title", clean_title])
 
@@ -1062,14 +1254,20 @@ class CodexTaskManager:
                 cmd.extend(["--commit", clean_commit])
             else:
                 assert clean_prompt is not None
-                if clean_prompt.startswith("-"):
+                budgeted_custom_prompt = _inject_time_budget_prompt(
+                    clean_prompt,
+                    max_duration_seconds=effective_max,
+                    soft_budget_seconds=soft_budget,
+                    max_idle_seconds=effective_idle,
+                )
+                if budgeted_custom_prompt.startswith("-"):
                     cmd.append("--")
-                cmd.append(clean_prompt)
+                cmd.append(budgeted_custom_prompt)
             return cmd
 
         defaults = read_codex_config_defaults()
         effective_model = clean_model or defaults["model"]
-        effective_effort = defaults["model_reasoning_effort"]
+        effective_effort = clean_effort or defaults["model_reasoning_effort"]
         preview_source = clean_prompt or clean_title or f"review ({effective_mode})"
 
         return self._launch_and_wait(
@@ -1083,6 +1281,10 @@ class CodexTaskManager:
             reasoning_effort=effective_effort,
             prompt_preview=_make_prompt_preview(preview_source),
             conversation_id=clean_conv_id,
+            max_duration_seconds=effective_max,
+            max_idle_seconds=effective_idle,
+            soft_budget_seconds=soft_budget,
+            soft_budget_injected=soft_injected,
             extra={
                 "review_mode": effective_mode,
                 "routed_via_exec": routed_via_exec,
@@ -1148,6 +1350,9 @@ class CodexTaskManager:
                 last_ev = enriched.get("last_event_at")
                 if isinstance(last_ev, (int, float)):
                     enriched["idle_ms"] = max(0, int((now_wall - float(last_ev)) * 1000))
+                max_dur = enriched.get("max_duration_seconds")
+                if isinstance(max_dur, (int, float)) and isinstance(enriched.get("elapsed_ms"), (int, float)):
+                    enriched["remaining_ms"] = max(0, int(max_dur * 1000) - int(enriched["elapsed_ms"]))
                 return enriched
             sleep_step = 0.02 if pid_dead else 0.1
             time.sleep(min(sleep_step, remaining))
@@ -1158,24 +1363,21 @@ class CodexTaskManager:
             tasks = list(self._tasks.values())
 
         for task in tasks:
+            task.watchdog_stop.set()
             if task.done_event.is_set():
                 if task.waiter_thread is not None and task.waiter_thread.is_alive():
                     task.waiter_thread.join(timeout=1.0)
+                if task.watchdog_thread is not None and task.watchdog_thread.is_alive():
+                    task.watchdog_thread.join(timeout=1.0)
                 continue
             proc = task.proc
             if terminate_running and proc is not None and proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except OSError:
-                    pass
-                if not task.done_event.wait(timeout=timeout) and proc.poll() is None:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except OSError:
-                        pass
+                _terminate_process_group(proc, grace_seconds=timeout)
             task.done_event.wait(timeout=1.0)
             if task.waiter_thread is not None and task.waiter_thread.is_alive():
                 task.waiter_thread.join(timeout=1.0)
+            if task.watchdog_thread is not None and task.watchdog_thread.is_alive():
+                task.watchdog_thread.join(timeout=1.0)
 
     def _claim_pending_conversation_id(
         self,
@@ -1274,6 +1476,10 @@ class CodexTaskManager:
         reasoning_effort: str | None = None,
         prompt_preview: str | None = None,
         conversation_id: str | None = None,
+        max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS,
+        max_idle_seconds: int | None = None,
+        soft_budget_seconds: int | None = None,
+        soft_budget_injected: bool = False,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         task_id = f"task_{uuid.uuid4().hex[:12]}"
@@ -1284,6 +1490,11 @@ class CodexTaskManager:
             mode=mode,
             cwd=str(cwd_path),
             prompt_preview=prompt_preview,
+        )
+        effective_soft = (
+            soft_budget_seconds
+            if soft_budget_seconds is not None
+            else max(1, int(max_duration_seconds * SOFT_BUDGET_RATIO))
         )
         now_mono = time.monotonic()
         now_wall = time.time()
@@ -1305,6 +1516,10 @@ class CodexTaskManager:
             activity="reviewing" if mode == "review" else "thinking",
             last_event_monotonic=now_mono,
             last_event_at=now_wall,
+            max_duration_seconds=max_duration_seconds,
+            max_idle_seconds=max_idle_seconds,
+            soft_budget_seconds=effective_soft,
+            soft_budget_injected=soft_budget_injected,
             owner_pid=owner_pid,
             is_resume=is_resume,
             session_id=initial_session_id,
@@ -1337,18 +1552,45 @@ class CodexTaskManager:
         with self._registry_lock:
             self._tasks[task_id] = task
 
-        with task.lock:
-            initial_record = self._build_running_record(
-                task,
-                pid=proc.pid,
-                owner_pid=owner_pid,
-            )
-            self._persist_task_unlocked(task_id, initial_record)
-            task.last_persist_monotonic = time.monotonic()
+        try:
+            with task.lock:
+                initial_record = self._build_running_record(
+                    task,
+                    pid=proc.pid,
+                    owner_pid=owner_pid,
+                )
+                self._persist_task_unlocked(task_id, initial_record)
+                task.last_persist_monotonic = time.monotonic()
 
-        waiter = threading.Thread(target=self._collect_task, args=(task,), daemon=True)
-        task.waiter_thread = waiter
-        waiter.start()
+            waiter = threading.Thread(target=self._collect_task, args=(task,), daemon=True)
+            task.waiter_thread = waiter
+            waiter.start()
+
+            watchdog = threading.Thread(target=self._watchdog_loop, args=(task,), daemon=True)
+            task.watchdog_thread = watchdog
+            watchdog.start()
+        except Exception as exc:
+            task.watchdog_stop.set()
+            _terminate_process_group(proc, grace_seconds=0.5)
+            try:
+                proc.wait(timeout=1.0)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            with self._registry_lock:
+                self._tasks.pop(task_id, None)
+            try:
+                tmp_dir.cleanup()
+            except OSError:
+                pass
+            task.watchdog_done.set()
+            task.done_event.set()
+            raise CodexRunnerError(f"Failed to initialize Codex task: {exc}") from exc
 
         if async_mode:
             return {
@@ -1366,7 +1608,12 @@ class CodexTaskManager:
                 "usage": None,
                 "elapsed_ms": 0,
                 "idle_ms": 0,
+                "remaining_ms": max_duration_seconds * 1000,
                 "last_event_at": now_wall,
+                "max_duration_seconds": max_duration_seconds,
+                "max_idle_seconds": max_idle_seconds,
+                "soft_budget_seconds": effective_soft,
+                "soft_budget_injected": soft_budget_injected,
                 "progress_events": 0,
                 "error": None,
             }
@@ -1383,6 +1630,7 @@ class CodexTaskManager:
         owner_pid: int | None = None,
     ) -> dict[str, Any]:
         now_mono = time.monotonic()
+        elapsed_ms = max(0, int((now_mono - task.start_monotonic) * 1000))
         record: dict[str, Any] = {
             "status": "running",
             "task_id": task.task_id,
@@ -1397,9 +1645,14 @@ class CodexTaskManager:
             "activity": task.activity,
             "usage": dict(task.live_usage) if task.live_usage is not None else None,
             "started_at": task.started_at,
-            "elapsed_ms": int((now_mono - task.start_monotonic) * 1000),
+            "elapsed_ms": elapsed_ms,
             "idle_ms": max(0, int((now_mono - task.last_event_monotonic) * 1000)),
+            "remaining_ms": max(0, task.max_duration_seconds * 1000 - elapsed_ms),
             "last_event_at": task.last_event_at,
+            "max_duration_seconds": task.max_duration_seconds,
+            "max_idle_seconds": task.max_idle_seconds,
+            "soft_budget_seconds": task.soft_budget_seconds,
+            "soft_budget_injected": task.soft_budget_injected,
             "progress_events": task.progress_events,
             "error": None,
         }
@@ -1536,9 +1789,62 @@ class CodexTaskManager:
             except OSError:
                 pass
 
+    def _watchdog_loop(self, task: _TaskState) -> None:
+        """Enforce hard wall-clock max_duration_seconds and optional max_idle_seconds."""
+        poll_interval = min(WATCHDOG_POLL_INTERVAL_SECONDS, max(0.05, task.max_duration_seconds / 10.0))
+        try:
+            while not task.watchdog_stop.wait(timeout=poll_interval):
+                proc_to_kill: subprocess.Popen | None = None
+                grace = HARD_KILL_GRACE_SECONDS
+                with task.lock:
+                    if task.done_event.is_set() or task.result is not None or task.timed_out:
+                        return
+                    proc = task.proc
+                    if proc is None or (proc.poll() is not None and not _is_pgid_alive(proc.pid)):
+                        return
+                    now_mono = time.monotonic()
+                    elapsed_s = now_mono - task.start_monotonic
+                    idle_s = now_mono - task.last_event_monotonic
+                    if elapsed_s >= task.max_duration_seconds:
+                        task.timed_out = True
+                        task.timeout_reason = "max_duration"
+                        task.timeout_detail = (
+                            f"Codex task exceeded hard duration limit "
+                            f"({task.max_duration_seconds}s; elapsed {elapsed_s:.1f}s)."
+                        )
+                        proc_to_kill = proc
+                        grace = min(HARD_KILL_GRACE_SECONDS, max(0.3, task.max_duration_seconds * 0.25))
+                    elif task.max_idle_seconds is not None and idle_s >= task.max_idle_seconds:
+                        task.timed_out = True
+                        task.timeout_reason = "max_idle"
+                        task.timeout_detail = (
+                            f"Codex task exceeded idle stall limit "
+                            f"({task.max_idle_seconds}s without progress events; idle {idle_s:.1f}s)."
+                        )
+                        proc_to_kill = proc
+                        grace = min(HARD_KILL_GRACE_SECONDS, max(0.3, task.max_idle_seconds * 0.25))
+                if proc_to_kill is not None:
+                    signaled = _terminate_process_group(proc_to_kill, grace_seconds=grace)
+                    with task.lock:
+                        if signaled:
+                            task.timeout_enforced = True
+                        else:
+                            task.timed_out = False
+                            task.timeout_enforced = False
+                            task.timeout_reason = None
+                            task.timeout_detail = None
+                    return
+        finally:
+            task.watchdog_done.set()
+
     def _collect_task(self, task: _TaskState) -> None:
         proc = task.proc
         assert proc is not None
+        stdout_thread: threading.Thread | None = None
+        stderr_thread: threading.Thread | None = None
+        was_timed_out = False
+        timeout_reason: str | None = None
+        timeout_detail: str | None = None
         try:
             stdout_thread = threading.Thread(target=self._drain_stdout, args=(task,), daemon=True)
             stderr_thread = threading.Thread(target=self._drain_stderr, args=(task,), daemon=True)
@@ -1546,8 +1852,20 @@ class CodexTaskManager:
             stderr_thread.start()
 
             returncode = proc.wait()
-            stdout_thread.join()
-            stderr_thread.join()
+            task.watchdog_stop.set()
+            if task.watchdog_thread is not None:
+                task.watchdog_done.wait(timeout=HARD_KILL_GRACE_SECONDS + 1.0)
+            with task.lock:
+                was_timed_out = task.timeout_enforced
+                timeout_reason = task.timeout_reason if was_timed_out else None
+                timeout_detail = task.timeout_detail if was_timed_out else None
+
+            stdout_thread.join(timeout=2.0)
+            stderr_thread.join(timeout=2.0)
+            if (stdout_thread.is_alive() or stderr_thread.is_alive()) and _is_pgid_alive(proc.pid):
+                _terminate_process_group(proc, grace_seconds=0.3)
+                stdout_thread.join(timeout=1.0)
+                stderr_thread.join(timeout=1.0)
 
             elapsed_ms = int((time.monotonic() - task.start_monotonic) * 1000)
             finished_at = time.time()
@@ -1576,7 +1894,7 @@ class CodexTaskManager:
                     last_msg_text = ""
 
             summary = last_msg_text or parsed["agent_text"]
-            if not summary and returncode == 0:
+            if not summary and returncode == 0 and not was_timed_out:
                 plain_lines: list[str] = []
                 for raw in stdout_text.splitlines():
                     stripped = raw.strip()
@@ -1589,8 +1907,19 @@ class CodexTaskManager:
                 summary = "\n".join(plain_lines).strip()
 
             error_msg: str | None = None
-            if returncode != 0:
-                err_parts: list[str] = list(parsed["errors"])
+            errors_list = list(parsed["errors"])
+            if was_timed_out:
+                detail = timeout_detail or f"Codex task exceeded time limit ({task.max_duration_seconds}s)."
+                if detail not in errors_list:
+                    errors_list.append(detail)
+                stderr_clean = stderr_text.strip()
+                if stderr_clean and stderr_clean not in errors_list:
+                    errors_list.append(stderr_clean)
+                error_msg = detail
+                if not summary:
+                    summary = detail
+            elif returncode != 0:
+                err_parts: list[str] = list(errors_list)
                 stderr_clean = stderr_text.strip()
                 if stderr_clean and stderr_clean not in err_parts:
                     err_parts.append(stderr_clean)
@@ -1602,11 +1931,12 @@ class CodexTaskManager:
                 Path(task.cwd),
                 task.baseline,
             )
-            final_status = "completed" if returncode == 0 else "failed"
+            final_status = "completed" if (returncode == 0 and not was_timed_out) else "failed"
+            final_activity = "timed_out" if was_timed_out else final_status
 
             result: dict[str, Any] = {
                 "status": final_status,
-                "activity": final_status,
+                "activity": final_activity,
                 "task_id": task.task_id,
                 "mode": task.mode,
                 "session_id": session_id,
@@ -1623,8 +1953,14 @@ class CodexTaskManager:
                 "events_count": parsed["events_count"],
                 "elapsed_ms": elapsed_ms,
                 "returncode": returncode,
+                "timed_out": was_timed_out,
+                "timeout_reason": timeout_reason,
+                "max_duration_seconds": task.max_duration_seconds,
+                "max_idle_seconds": task.max_idle_seconds,
+                "soft_budget_seconds": task.soft_budget_seconds,
+                "soft_budget_injected": task.soft_budget_injected,
                 "error": error_msg,
-                "errors": parsed["errors"],
+                "errors": errors_list,
             }
             self._attach_mode_fields(
                 task,
@@ -1632,7 +1968,8 @@ class CodexTaskManager:
                 changed_files=changed_files,
                 pre_dirty=pre_dirty,
                 diff_stat=diff_stat,
-                failed=returncode != 0,
+                failed=final_status != "completed",
+                timed_out=was_timed_out,
             )
 
             with task.lock:
@@ -1640,17 +1977,31 @@ class CodexTaskManager:
                     task.persist_timer.cancel()
                     task.persist_timer = None
                 task.persist_dirty = False
-                task.activity = final_status
+                task.timed_out = was_timed_out
+                task.timeout_reason = timeout_reason
+                task.timeout_detail = timeout_detail
+                task.activity = final_activity
                 task.finished_at = finished_at
                 task.result = result
                 task.session_id = session_id
                 self._persist_task_unlocked(task.task_id, result)
         except Exception as exc:
+            task.watchdog_stop.set()
+            with task.lock:
+                err_timed_out = bool(was_timed_out or task.timeout_enforced)
+                err_reason = timeout_reason or (task.timeout_reason if err_timed_out else None)
+                err_detail = timeout_detail or (task.timeout_detail if err_timed_out else None)
             elapsed_ms = int((time.monotonic() - task.start_monotonic) * 1000)
             finished_at = time.time()
+            fallback_activity = "timed_out" if err_timed_out else "failed"
+            fallback_err = (
+                f"{err_detail} (finalization error: {exc})"
+                if err_timed_out and err_detail
+                else f"Internal runner error: {exc}"
+            )
             fallback: dict[str, Any] = {
                 "status": "failed",
-                "activity": "failed",
+                "activity": fallback_activity,
                 "task_id": task.task_id,
                 "mode": task.mode,
                 "session_id": task.session_id,
@@ -1662,13 +2013,19 @@ class CodexTaskManager:
                 "prompt_preview": task.prompt_preview,
                 "started_at": task.started_at,
                 "finished_at": finished_at,
-                "summary": f"Internal runner error: {exc}",
+                "summary": fallback_err,
                 "usage": None,
                 "events_count": task.progress_events,
                 "elapsed_ms": elapsed_ms,
-                "returncode": None,
-                "error": f"Internal runner error: {exc}",
-                "errors": [str(exc)],
+                "returncode": proc.poll(),
+                "timed_out": err_timed_out,
+                "timeout_reason": err_reason,
+                "max_duration_seconds": task.max_duration_seconds,
+                "max_idle_seconds": task.max_idle_seconds,
+                "soft_budget_seconds": task.soft_budget_seconds,
+                "soft_budget_injected": task.soft_budget_injected,
+                "error": fallback_err,
+                "errors": [fallback_err],
             }
             self._attach_mode_fields(
                 task,
@@ -1677,17 +2034,26 @@ class CodexTaskManager:
                 pre_dirty=[],
                 diff_stat=None,
                 failed=True,
+                timed_out=err_timed_out,
             )
             with task.lock:
+                if task.persist_timer is not None:
+                    task.persist_timer.cancel()
+                    task.persist_timer = None
+                task.persist_dirty = False
                 task.stdout_lines.clear()
                 task.stderr_lines.clear()
-                task.activity = "failed"
+                task.activity = fallback_activity
                 task.finished_at = finished_at
                 task.result = fallback
-                self._persist_task_unlocked(task.task_id, fallback)
+                try:
+                    self._persist_task_unlocked(task.task_id, fallback)
+                except OSError:
+                    pass
         finally:
-            for stream in (proc.stdout, proc.stderr):
-                if stream is not None and not stream.closed:
+            task.watchdog_stop.set()
+            for stream, reader in ((proc.stdout, stdout_thread), (proc.stderr, stderr_thread)):
+                if stream is not None and not stream.closed and (reader is None or not reader.is_alive()):
                     try:
                         stream.close()
                     except OSError:
@@ -1707,12 +2073,20 @@ class CodexTaskManager:
         pre_dirty: list[str],
         diff_stat: str | None,
         failed: bool,
+        timed_out: bool = False,
     ) -> None:
         if task.mode in ("exec", "resume"):
             payload["changed_files"] = changed_files
             payload["pre_existing_dirty_files"] = pre_dirty
             payload["diff_stat"] = diff_stat
-            if task.is_resume and failed:
+            if timed_out:
+                payload["resume_failed"] = False
+                payload["hint"] = (
+                    "Codex task was terminated by the hard execution time limit. "
+                    "Inspect partial summary and changed_files; if needed, resume via codex_run(session_id=...) "
+                    "with a larger max_duration_seconds or narrower scope."
+                )
+            elif task.is_resume and failed:
                 payload["resume_failed"] = True
                 payload["hint"] = (
                     "Codex session resume failed (the session may be missing, expired, or incompatible). "
@@ -1721,6 +2095,12 @@ class CodexTaskManager:
             else:
                 payload["resume_failed"] = False
                 payload["hint"] = None
+        elif timed_out:
+            payload["hint"] = (
+                "Codex task was terminated by the hard execution time limit. "
+                "Inspect partial summary and consider narrowing scope, lowering reasoning_effort, "
+                "or increasing max_duration_seconds."
+            )
         if task.mode == "review":
             payload["review_mode"] = task.extra.get("review_mode")
             payload["routed_via_exec"] = bool(task.extra.get("routed_via_exec", False))

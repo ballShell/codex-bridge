@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -112,6 +114,23 @@ def _parse_exec_flags(args: list[str], *, allow_sandbox_and_cd: bool) -> tuple[d
 
 
 def _maybe_sleep() -> None:
+    if os.environ.get("FAKE_CODEX_TRAP_SIGTERM_EXIT_ZERO") == "1":
+        def _on_term(_signum, _frame):
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, _on_term)
+
+    if os.environ.get("FAKE_CODEX_SPAWN_PIPE_HOLDER") == "1":
+        # Spawn a descendant in the same process group that ignores SIGTERM and holds stdout open.
+        pid_file = os.environ.get("FAKE_CODEX_DESCENDANT_PID_FILE", "").strip()
+        holder_code = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(30)"
+        )
+        child = subprocess.Popen([sys.executable, "-c", holder_code])
+        if pid_file:
+            Path(pid_file).write_text(str(child.pid), encoding="utf-8")
+
     raw = os.environ.get("FAKE_CODEX_SLEEP", "").strip()
     if raw:
         try:

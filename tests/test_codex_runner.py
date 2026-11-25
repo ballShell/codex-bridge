@@ -272,7 +272,9 @@ class TestCodexTaskManager(unittest.TestCase):
         self.assertEqual(self._flag_value(argv, "-m", "--model"), "gpt-5.4")
         self.assertEqual(self._flag_value(argv, "-i", "--image"), "diagram.png")
         self.assertIn('model_reasoning_effort="high"', argv)
-        self.assertEqual(argv[-2:], ["--", "Design the API module"])
+        self.assertEqual(argv[-2], "--")
+        self.assertTrue(argv[-1].startswith("Design the API module"))
+        self.assertIn("[Execution Time Budget — Soft Constraint]", argv[-1])
 
         repo = self._init_git_repo("git_plan_repo")
         res_git = self.manager.run_plan(prompt="Inspect repo", cwd=str(repo))
@@ -502,7 +504,8 @@ class TestCodexTaskManager(unittest.TestCase):
         argv_custom = invocations[2]["argv"]
         self.assertEqual(argv_custom[:2], ["exec", "review"])
         self.assertEqual(self._flag_value(argv_custom, "-c"), 'sandbox_mode="read-only"')
-        self.assertIn("audit error handling", argv_custom)
+        self.assertTrue(argv_custom[-1].startswith("audit error handling"))
+        self.assertIn("[Execution Time Budget — Soft Constraint]", argv_custom[-1])
         self.assertNotIn("--uncommitted", argv_custom)
         self.assertNotIn("--base", argv_custom)
         self.assertNotIn("--commit", argv_custom)
@@ -793,7 +796,9 @@ class TestCodexTaskManager(unittest.TestCase):
                 self.assertEqual(argv[0], "exec")
                 self.assertNotEqual(argv[1], "resume")
             sep_idx = argv.index("--")
-            self.assertEqual(argv[sep_idx + 1 :], [prompt])
+            self.assertEqual(len(argv[sep_idx + 1 :]), 1)
+            self.assertTrue(argv[sep_idx + 1].startswith(prompt))
+            self.assertIn("[Execution Time Budget — Soft Constraint]", argv[sep_idx + 1])
             self.assertLess(argv.index("img1.png"), sep_idx)
             self.assertLess(argv.index("img2.png"), sep_idx)
 
@@ -1115,6 +1120,182 @@ class TestCodexTaskManager(unittest.TestCase):
 
             done = self.manager.poll_task(handle["task_id"], wait_seconds=5)
             self.assertEqual(done["status"], "completed")
+
+    def test_soft_time_budget_prompt_injection_and_clean_preview(self) -> None:
+        repo = self._init_git_repo("budget_prompt_repo")
+        args_file = Path(self._tmp.name) / "budget_args.jsonl"
+        with mock.patch.dict(os.environ, {"FAKE_CODEX_ARGS_FILE": str(args_file)}, clear=False):
+            plan_res = self.manager.run_plan(
+                prompt="Plan bounded cache refactor",
+                cwd=str(repo),
+                max_duration_seconds=300,
+                max_idle_seconds=150,
+            )
+            native_review = self.manager.run_review(
+                cwd=str(repo),
+                mode="uncommitted",
+                reasoning_effort="low",
+                max_duration_seconds=180,
+            )
+            prompt_review = self.manager.run_review(
+                cwd=str(repo),
+                mode="uncommitted",
+                prompt="Focus on thread safety",
+                reasoning_effort="medium",
+                max_duration_seconds=200,
+            )
+
+        self.assertEqual(plan_res["status"], "completed")
+        self.assertEqual(plan_res["timed_out"], False)
+        self.assertIsNone(plan_res["timeout_reason"])
+        self.assertEqual(plan_res["max_duration_seconds"], 300)
+        self.assertEqual(plan_res["max_idle_seconds"], 150)
+        self.assertEqual(plan_res["soft_budget_seconds"], 240)
+        self.assertTrue(plan_res["soft_budget_injected"])
+        self.assertEqual(plan_res["prompt_preview"], "Plan bounded cache refactor")
+
+        self.assertEqual(native_review["status"], "completed")
+        self.assertFalse(native_review["soft_budget_injected"])
+        self.assertEqual(native_review["reasoning_effort"], "low")
+
+        self.assertEqual(prompt_review["status"], "completed")
+        self.assertTrue(prompt_review["soft_budget_injected"])
+        self.assertEqual(prompt_review["reasoning_effort"], "medium")
+
+        invocations = [json.loads(line) for line in args_file.read_text(encoding="utf-8").splitlines()]
+        plan_prompt = invocations[0]["argv"][-1]
+        self.assertIn("[Execution Time Budget — Soft Constraint]", plan_prompt)
+        self.assertIn("Hard time limit: 300s", plan_prompt)
+        self.assertIn("within ~240s", plan_prompt)
+        self.assertIn("Idle stall limit: 150s", plan_prompt)
+        self.assertIn('model_reasoning_effort="low"', invocations[1]["argv"])
+        self.assertIn("[Execution Time Budget — Soft Constraint]", invocations[2]["argv"][-1])
+
+    def test_hard_max_duration_watchdog_terminates_and_preserves_session(self) -> None:
+        repo = self._init_git_repo("hard_timeout_repo")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_CODEX_SLEEP": "10",
+                "FAKE_CODEX_SESSION_ID": "thr_timeout_preserve",
+            },
+            clear=False,
+        ):
+            res = self.manager.run_exec(
+                prompt="Run long task",
+                cwd=str(repo),
+                session_id="thr_timeout_preserve",
+                wait_seconds=10,
+                max_duration_seconds=1,
+            )
+
+        self.assertEqual(res["status"], "failed")
+        self.assertEqual(res["activity"], "timed_out")
+        self.assertTrue(res["timed_out"])
+        self.assertEqual(res["timeout_reason"], "max_duration")
+        self.assertEqual(res["session_id"], "thr_timeout_preserve")
+        self.assertFalse(res["resume_failed"])
+        self.assertIn("hard duration limit", (res["error"] or "").lower())
+        self.assertIn("max_duration_seconds", res["hint"] or "")
+
+    def test_hard_max_idle_watchdog_terminates_stalled_task(self) -> None:
+        repo = self._init_git_repo("idle_timeout_repo")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_CODEX_SLEEP": "10",
+                "FAKE_CODEX_SESSION_ID": "thr_idle_stall",
+            },
+            clear=False,
+        ):
+            res = self.manager.run_plan(
+                prompt="Stalled plan task",
+                cwd=str(repo),
+                wait_seconds=10,
+                max_duration_seconds=30,
+                max_idle_seconds=1,
+            )
+
+        self.assertEqual(res["status"], "failed")
+        self.assertEqual(res["activity"], "timed_out")
+        self.assertTrue(res["timed_out"])
+        self.assertEqual(res["timeout_reason"], "max_idle")
+        self.assertEqual(res["session_id"], "thr_idle_stall")
+        self.assertIn("idle stall limit", (res["error"] or "").lower())
+
+    def test_duration_constraint_validation_and_clamping(self) -> None:
+        repo = self._init_git_repo("validate_duration_repo")
+        with self.assertRaises(CodexRunnerError):
+            self.manager.run_plan(prompt="Bad max", cwd=str(repo), max_duration_seconds=0)
+        with self.assertRaises(CodexRunnerError):
+            self.manager.run_plan(prompt="Bad max", cwd=str(repo), max_duration_seconds=9999)
+        with self.assertRaises(CodexRunnerError):
+            self.manager.run_plan(prompt="Bad idle", cwd=str(repo), max_idle_seconds=0)
+
+        # max_idle_seconds > max_duration_seconds clamps cleanly to max_duration_seconds
+        clamped = self.manager.run_plan(
+            prompt="Clamped idle",
+            cwd=str(repo),
+            max_duration_seconds=60,
+            max_idle_seconds=120,
+        )
+        self.assertEqual(clamped["status"], "completed")
+        self.assertEqual(clamped["max_duration_seconds"], 60)
+        self.assertEqual(clamped["max_idle_seconds"], 60)
+
+    def test_watchdog_kills_descendant_holding_pipe_open(self) -> None:
+        repo = self._init_git_repo("pipe_holder_repo")
+        pid_file = Path(self._tmp.name) / "descendant.pid"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_CODEX_SPAWN_PIPE_HOLDER": "1",
+                "FAKE_CODEX_DESCENDANT_PID_FILE": str(pid_file),
+                "FAKE_CODEX_SLEEP": "10",
+            },
+            clear=False,
+        ):
+            res = self.manager.run_plan(
+                prompt="Spawn pipe-holding descendant",
+                cwd=str(repo),
+                wait_seconds=10,
+                max_duration_seconds=1,
+            )
+
+        self.assertEqual(res["status"], "failed")
+        self.assertEqual(res["activity"], "timed_out")
+        self.assertTrue(res["timed_out"])
+        self.assertEqual(res["timeout_reason"], "max_duration")
+        self.assertTrue(pid_file.is_file())
+        desc_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        # Descendant that ignored SIGTERM must have been terminated via process-group SIGKILL
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and codex_runner._is_pid_alive(desc_pid):
+            time.sleep(0.05)
+        self.assertFalse(codex_runner._is_pid_alive(desc_pid))
+
+    def test_sigterm_exit_zero_still_classified_as_timed_out(self) -> None:
+        repo = self._init_git_repo("sigterm_zero_repo")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_CODEX_TRAP_SIGTERM_EXIT_ZERO": "1",
+                "FAKE_CODEX_SLEEP": "10",
+            },
+            clear=False,
+        ):
+            res = self.manager.run_plan(
+                prompt="Trap SIGTERM and exit 0",
+                cwd=str(repo),
+                wait_seconds=10,
+                max_duration_seconds=1,
+            )
+
+        self.assertEqual(res["status"], "failed")
+        self.assertEqual(res["activity"], "timed_out")
+        self.assertTrue(res["timed_out"])
+        self.assertEqual(res["timeout_reason"], "max_duration")
+        self.assertEqual(res["returncode"], 0)
 
 
 if __name__ == "__main__":

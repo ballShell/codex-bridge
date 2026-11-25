@@ -9,8 +9,9 @@ Guide heavy engineering tasks from human intent to verified implementation using
 
 ## MCP Reference (`codex-bridge_codex`)
 
-- Eager tools (exposed directly as `mcp_codex-bridge_codex_<tool>` or via `call_mcp_tool`): `codex_status`, `codex_plan`, `codex_run`, `codex_review`.
-- Lazy polling tool: `call_mcp_tool(ServerName="codex-bridge_codex", ToolName="codex_poll", Arguments={"task_id": "<id>", "wait_seconds": 30})`.
+- Eager tool: `codex_status`.
+- Lazy tools (invoked via `call_mcp_tool(ServerName="codex-bridge_codex", ToolName="<tool>", Arguments={...})`): `codex_plan`, `codex_run`, `codex_review`, `codex_poll`.
+- Duration constraints: always estimate and pass `max_duration_seconds` (and optional `max_idle_seconds`) on `codex_plan`, `codex_run`, and `codex_review` so `codex-bridge` enforces the hard process-group timeout on all calls and injects an ~80% soft prompt budget on `codex_plan`, `codex_run`, and prompt-bearing `codex_review` (prompt-less native reviews receive the hard watchdog only).
 
 ## Step 1: Preflight & Workspace Guard
 

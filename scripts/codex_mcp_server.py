@@ -17,9 +17,12 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from codex_runner import (  # noqa: E402
+    DEFAULT_MAX_DURATION_SECONDS,
     DEFAULT_POLL_WAIT_SECONDS,
     DEFAULT_WAIT_SECONDS,
+    MAX_DURATION_SECONDS,
     MAX_WAIT_SECONDS,
+    MIN_DURATION_SECONDS,
     VALID_REVIEW_MODES,
     CodexRunnerError,
     CodexTaskManager,
@@ -122,6 +125,25 @@ def _build_tool_definitions() -> list[dict[str, Any]]:
                         "default": DEFAULT_WAIT_SECONDS,
                         "description": "Maximum seconds to wait synchronously before returning a running handle.",
                     },
+                    "max_duration_seconds": {
+                        "type": "integer",
+                        "minimum": MIN_DURATION_SECONDS,
+                        "maximum": MAX_DURATION_SECONDS,
+                        "default": DEFAULT_MAX_DURATION_SECONDS,
+                        "description": (
+                            "Hard wall-clock execution limit in seconds estimated by the main model. "
+                            "Also automatically injects an ~80% soft time-budget directive into the Codex prompt."
+                        ),
+                    },
+                    "max_idle_seconds": {
+                        "type": "integer",
+                        "minimum": MIN_DURATION_SECONDS,
+                        "maximum": MAX_DURATION_SECONDS,
+                        "description": (
+                            "Optional hard idle stall limit in seconds without Codex progress events "
+                            "(clamped to <= max_duration_seconds)."
+                        ),
+                    },
                 },
                 "required": ["prompt", "cwd"],
                 "additionalProperties": False,
@@ -185,6 +207,25 @@ def _build_tool_definitions() -> list[dict[str, Any]]:
                         "maximum": MAX_WAIT_SECONDS,
                         "default": DEFAULT_WAIT_SECONDS,
                         "description": "Maximum seconds to wait synchronously when async_mode is false.",
+                    },
+                    "max_duration_seconds": {
+                        "type": "integer",
+                        "minimum": MIN_DURATION_SECONDS,
+                        "maximum": MAX_DURATION_SECONDS,
+                        "default": DEFAULT_MAX_DURATION_SECONDS,
+                        "description": (
+                            "Hard wall-clock execution limit in seconds estimated by the main model. "
+                            "Also automatically injects an ~80% soft time-budget directive into the Codex prompt."
+                        ),
+                    },
+                    "max_idle_seconds": {
+                        "type": "integer",
+                        "minimum": MIN_DURATION_SECONDS,
+                        "maximum": MAX_DURATION_SECONDS,
+                        "description": (
+                            "Optional hard idle stall limit in seconds without Codex progress events "
+                            "(clamped to <= max_duration_seconds)."
+                        ),
                     },
                 },
                 "required": ["prompt", "cwd"],
@@ -257,6 +298,10 @@ def _build_tool_definitions() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": "Optional Codex model override.",
                     },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "description": "Optional model_reasoning_effort override (e.g., low, medium, high, xhigh).",
+                    },
                     "conversation_id": {
                         "type": "string",
                         "description": "Optional Antigravity conversation ID owning this Codex task.",
@@ -267,6 +312,25 @@ def _build_tool_definitions() -> list[dict[str, Any]]:
                         "maximum": MAX_WAIT_SECONDS,
                         "default": DEFAULT_WAIT_SECONDS,
                         "description": "Maximum seconds to wait synchronously for review completion.",
+                    },
+                    "max_duration_seconds": {
+                        "type": "integer",
+                        "minimum": MIN_DURATION_SECONDS,
+                        "maximum": MAX_DURATION_SECONDS,
+                        "default": DEFAULT_MAX_DURATION_SECONDS,
+                        "description": (
+                            "Hard wall-clock execution limit in seconds estimated by the main model. "
+                            "Injects an ~80% soft time-budget directive whenever prompt-based review routing is used."
+                        ),
+                    },
+                    "max_idle_seconds": {
+                        "type": "integer",
+                        "minimum": MIN_DURATION_SECONDS,
+                        "maximum": MAX_DURATION_SECONDS,
+                        "description": (
+                            "Optional hard idle stall limit in seconds without Codex progress events "
+                            "(clamped to <= max_duration_seconds)."
+                        ),
                     },
                 },
                 "required": ["cwd"],
@@ -314,6 +378,15 @@ def _opt_int(args: dict[str, Any], key: str, default: int) -> int:
     val = args.get(key)
     if val is None:
         return default
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise CodexRunnerError(f"{key} must be an integer.")
+    return val
+
+
+def _opt_nullable_int(args: dict[str, Any], key: str) -> int | None:
+    if key not in args:
+        return None
+    val = args[key]
     if isinstance(val, bool) or not isinstance(val, int):
         raise CodexRunnerError(f"{key} must be an integer.")
     return val
@@ -368,7 +441,17 @@ class McpServer:
     def _call_plan(self, args: dict[str, Any]) -> dict[str, Any]:
         _validate_arg_keys(
             args,
-            {"prompt", "cwd", "model", "reasoning_effort", "images", "conversation_id", "wait_seconds"},
+            {
+                "prompt",
+                "cwd",
+                "model",
+                "reasoning_effort",
+                "images",
+                "conversation_id",
+                "wait_seconds",
+                "max_duration_seconds",
+                "max_idle_seconds",
+            },
             ("prompt", "cwd"),
         )
         return self.manager.run_plan(
@@ -379,6 +462,8 @@ class McpServer:
             images=_opt_str_list(args, "images"),
             conversation_id=_opt_str(args, "conversation_id"),
             wait_seconds=_opt_int(args, "wait_seconds", DEFAULT_WAIT_SECONDS),
+            max_duration_seconds=_opt_nullable_int(args, "max_duration_seconds"),
+            max_idle_seconds=_opt_nullable_int(args, "max_idle_seconds"),
         )
 
     def _call_run(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -395,6 +480,8 @@ class McpServer:
                 "conversation_id",
                 "async_mode",
                 "wait_seconds",
+                "max_duration_seconds",
+                "max_idle_seconds",
             },
             ("prompt", "cwd"),
         )
@@ -410,6 +497,8 @@ class McpServer:
             conversation_id=_opt_str(args, "conversation_id"),
             async_mode=_opt_bool(args, "async_mode", False),
             wait_seconds=_opt_int(args, "wait_seconds", DEFAULT_WAIT_SECONDS),
+            max_duration_seconds=_opt_nullable_int(args, "max_duration_seconds"),
+            max_idle_seconds=_opt_nullable_int(args, "max_idle_seconds"),
         )
 
     def _call_poll(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -422,7 +511,20 @@ class McpServer:
     def _call_review(self, args: dict[str, Any]) -> dict[str, Any]:
         _validate_arg_keys(
             args,
-            {"cwd", "mode", "base_branch", "commit_sha", "title", "prompt", "model", "conversation_id", "wait_seconds"},
+            {
+                "cwd",
+                "mode",
+                "base_branch",
+                "commit_sha",
+                "title",
+                "prompt",
+                "model",
+                "reasoning_effort",
+                "conversation_id",
+                "wait_seconds",
+                "max_duration_seconds",
+                "max_idle_seconds",
+            },
             ("cwd",),
         )
         mode = _opt_str(args, "mode")
@@ -434,8 +536,11 @@ class McpServer:
             title=_opt_str(args, "title"),
             prompt=_opt_str(args, "prompt"),
             model=_opt_str(args, "model"),
+            reasoning_effort=_opt_str(args, "reasoning_effort"),
             conversation_id=_opt_str(args, "conversation_id"),
             wait_seconds=_opt_int(args, "wait_seconds", DEFAULT_WAIT_SECONDS),
+            max_duration_seconds=_opt_nullable_int(args, "max_duration_seconds"),
+            max_idle_seconds=_opt_nullable_int(args, "max_idle_seconds"),
         )
 
     def _handle_initialize(self, params: dict[str, Any]) -> dict[str, Any]:

@@ -11,6 +11,7 @@ Execute targeted user-delegated tasks with Codex cleanly and without unnecessary
 
 - Eager tool: `codex_status`.
 - Lazy tools (invoked via `call_mcp_tool(ServerName="codex-bridge_codex", ToolName="<tool>", Arguments={...})`): `codex_plan`, `codex_run`, `codex_review`, `codex_poll`.
+- Duration constraints: always estimate and pass `max_duration_seconds` (and optional `max_idle_seconds`) on `codex_plan`, `codex_run`, and `codex_review`; `codex-bridge` enforces the hard watchdog timeout on all calls and injects an ~80% soft time-budget directive on `codex_plan`, `codex_run`, and prompt-bearing `codex_review` (prompt-less native reviews receive the hard watchdog only).
 
 ## Step 1: Workspace & Readiness Check
 

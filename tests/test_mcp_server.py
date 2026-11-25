@@ -166,7 +166,11 @@ class TestMcpServer(unittest.TestCase):
             for expected_mode in ("uncommitted", "base", "commit", "custom"):
                 self.assertIn(expected_mode, mode_desc)
             for tool_name in ("codex_plan", "codex_run", "codex_review"):
-                self.assertIn("conversation_id", by_name[tool_name]["inputSchema"]["properties"])
+                props = by_name[tool_name]["inputSchema"]["properties"]
+                self.assertIn("conversation_id", props)
+                self.assertIn("max_duration_seconds", props)
+                self.assertIn("max_idle_seconds", props)
+                self.assertIn("reasoning_effort", props)
         finally:
             rc, _ = client.close()
         self.assertEqual(rc, 0)
@@ -581,6 +585,38 @@ class TestMcpServer(unittest.TestCase):
             task_b_disk = json.loads((self.data_dir / "tasks" / f"{payload_b['task_id']}.json").read_text("utf-8"))
             self.assertEqual(task_a_disk["conversation_id"], "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
             self.assertEqual(task_b_disk["conversation_id"], "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        finally:
+            rc, _ = client.close()
+        self.assertEqual(rc, 0)
+
+    def test_explicit_null_duration_arguments_rejected_at_mcp_boundary(self) -> None:
+        client = _McpClient(self.data_dir)
+        try:
+            client.request(
+                "initialize",
+                {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test-client", "version": "1.0.0"},
+                },
+            )
+            client.send_notification("notifications/initialized")
+
+            for arg_name in ("max_duration_seconds", "max_idle_seconds"):
+                resp = client.request(
+                    "tools/call",
+                    {
+                        "name": "codex_plan",
+                        "arguments": {
+                            "prompt": "Check null rejection",
+                            "cwd": str(self.workdir),
+                            arg_name: None,
+                        },
+                    },
+                )
+                self.assertTrue(resp["result"]["isError"])
+                payload = json.loads(resp["result"]["content"][0]["text"])
+                self.assertIn("must be an integer", payload["error"])
         finally:
             rc, _ = client.close()
         self.assertEqual(rc, 0)
