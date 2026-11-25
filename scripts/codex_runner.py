@@ -762,7 +762,11 @@ class _TaskState:
     conversation_id: str | None = None
     activity: str = "starting"
     live_usage: dict[str, int] | None = None
+    last_event_monotonic: float = 0.0
+    last_event_at: float = 0.0
     last_persist_monotonic: float = 0.0
+    persist_dirty: bool = False
+    persist_timer: threading.Timer | None = None
     owner_pid: int | None = None
     finished_at: float | None = None
     is_resume: bool = False
@@ -1134,7 +1138,17 @@ class CodexTaskManager:
                 return reconciled
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return reconciled
+                enriched = dict(reconciled)
+                now_wall = time.time()
+                started = enriched.get("started_at")
+                if isinstance(started, (int, float)):
+                    persisted_elapsed = enriched.get("elapsed_ms")
+                    base_elapsed = int(persisted_elapsed) if isinstance(persisted_elapsed, (int, float)) else 0
+                    enriched["elapsed_ms"] = max(base_elapsed, int((now_wall - float(started)) * 1000))
+                last_ev = enriched.get("last_event_at")
+                if isinstance(last_ev, (int, float)):
+                    enriched["idle_ms"] = max(0, int((now_wall - float(last_ev)) * 1000))
+                return enriched
             sleep_step = 0.02 if pid_dead else 0.1
             time.sleep(min(sleep_step, remaining))
 
@@ -1271,14 +1285,16 @@ class CodexTaskManager:
             cwd=str(cwd_path),
             prompt_preview=prompt_preview,
         )
+        now_mono = time.monotonic()
+        now_wall = time.time()
         task = _TaskState(
             task_id=task_id,
             mode=mode,
             cwd=str(cwd_path),
             sandbox=sandbox,
             extra=dict(extra or {}),
-            start_monotonic=time.monotonic(),
-            started_at=time.time(),
+            start_monotonic=now_mono,
+            started_at=now_wall,
             tmp_dir=tmp_dir,
             last_msg_path=last_msg_path,
             baseline=baseline,
@@ -1287,6 +1303,8 @@ class CodexTaskManager:
             prompt_preview=prompt_preview,
             conversation_id=resolved_conv_id,
             activity="reviewing" if mode == "review" else "thinking",
+            last_event_monotonic=now_mono,
+            last_event_at=now_wall,
             owner_pid=owner_pid,
             is_resume=is_resume,
             session_id=initial_session_id,
@@ -1347,6 +1365,8 @@ class CodexTaskManager:
                 "activity": task.activity,
                 "usage": None,
                 "elapsed_ms": 0,
+                "idle_ms": 0,
+                "last_event_at": now_wall,
                 "progress_events": 0,
                 "error": None,
             }
@@ -1362,6 +1382,7 @@ class CodexTaskManager:
         pid: int | None = None,
         owner_pid: int | None = None,
     ) -> dict[str, Any]:
+        now_mono = time.monotonic()
         record: dict[str, Any] = {
             "status": "running",
             "task_id": task.task_id,
@@ -1376,7 +1397,9 @@ class CodexTaskManager:
             "activity": task.activity,
             "usage": dict(task.live_usage) if task.live_usage is not None else None,
             "started_at": task.started_at,
-            "elapsed_ms": int((time.monotonic() - task.start_monotonic) * 1000),
+            "elapsed_ms": int((now_mono - task.start_monotonic) * 1000),
+            "idle_ms": max(0, int((now_mono - task.last_event_monotonic) * 1000)),
+            "last_event_at": task.last_event_at,
             "progress_events": task.progress_events,
             "error": None,
         }
@@ -1411,6 +1434,25 @@ class CodexTaskManager:
                     return "reviewing" if mode == "review" else "coding"
         return None
 
+    def _flush_pending_persist(self, task: _TaskState) -> None:
+        with task.lock:
+            task.persist_timer = None
+            if not task.persist_dirty or task.result is not None or task.done_event.is_set():
+                return
+            proc = task.proc
+            pid = proc.pid if proc is not None else None
+            try:
+                record = self._build_running_record(
+                    task,
+                    pid=pid,
+                    owner_pid=task.owner_pid,
+                )
+                self._persist_task_unlocked(task.task_id, record)
+                task.last_persist_monotonic = time.monotonic()
+                task.persist_dirty = False
+            except OSError:
+                pass
+
     def _drain_stdout(self, task: _TaskState) -> None:
         proc = task.proc
         if proc is None or proc.stdout is None:
@@ -1429,19 +1471,19 @@ class CodexTaskManager:
                 with task.lock:
                     task.stdout_lines.append(line)
                     if parsed_event is not None:
+                        now_mono = time.monotonic()
                         task.progress_events += 1
-                        changed = False
+                        task.last_event_monotonic = now_mono
+                        task.last_event_at = time.time()
                         thread_id = parsed_event.get("thread_id")
                         if isinstance(thread_id, str) and (
                             parsed_event.get("type") == "thread.started" or task.session_id is None
                         ) and task.session_id != thread_id:
                             task.session_id = thread_id
-                            changed = True
 
                         next_activity = self._derive_activity_from_event(parsed_event, task.mode)
                         if next_activity is not None and next_activity != task.activity:
                             task.activity = next_activity
-                            changed = True
 
                         if parsed_event.get("type") == "turn.completed" and isinstance(
                             parsed_event.get("usage"), dict
@@ -1449,10 +1491,12 @@ class CodexTaskManager:
                             norm_usage = normalize_usage(parsed_event["usage"])
                             if norm_usage is not None and norm_usage != task.live_usage:
                                 task.live_usage = norm_usage
-                                changed = True
 
-                        now_mono = time.monotonic()
-                        if changed and (now_mono - task.last_persist_monotonic) >= PERSIST_THROTTLE_SECONDS:
+                        since_persist = now_mono - task.last_persist_monotonic
+                        if since_persist >= PERSIST_THROTTLE_SECONDS:
+                            if task.persist_timer is not None:
+                                task.persist_timer.cancel()
+                                task.persist_timer = None
                             try:
                                 record = self._build_running_record(
                                     task,
@@ -1461,8 +1505,17 @@ class CodexTaskManager:
                                 )
                                 self._persist_task_unlocked(task.task_id, record)
                                 task.last_persist_monotonic = now_mono
+                                task.persist_dirty = False
                             except OSError:
                                 pass
+                        else:
+                            task.persist_dirty = True
+                            if task.persist_timer is None:
+                                delay = max(0.05, PERSIST_THROTTLE_SECONDS - since_persist)
+                                timer = threading.Timer(delay, self._flush_pending_persist, args=(task,))
+                                timer.daemon = True
+                                task.persist_timer = timer
+                                timer.start()
         finally:
             try:
                 proc.stdout.close()
@@ -1583,6 +1636,10 @@ class CodexTaskManager:
             )
 
             with task.lock:
+                if task.persist_timer is not None:
+                    task.persist_timer.cancel()
+                    task.persist_timer = None
+                task.persist_dirty = False
                 task.activity = final_status
                 task.finished_at = finished_at
                 task.result = result

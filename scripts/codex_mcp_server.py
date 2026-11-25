@@ -151,9 +151,11 @@ def _build_tool_definitions() -> list[dict[str, Any]]:
                     },
                     "sandbox": {
                         "type": "string",
-                        "enum": _sandbox_enum(),
                         "default": "workspace-write",
-                        "description": "Codex execution sandbox mode.",
+                        "description": (
+                            "Codex execution sandbox mode. "
+                            f"Allowed values: {', '.join(_sandbox_enum())}."
+                        ),
                     },
                     "model": {
                         "type": "string",
@@ -229,9 +231,11 @@ def _build_tool_definitions() -> list[dict[str, Any]]:
                     },
                     "mode": {
                         "type": "string",
-                        "enum": list(VALID_REVIEW_MODES),
                         "default": "uncommitted",
-                        "description": "Review target mode.",
+                        "description": (
+                            "Review target mode. "
+                            f"Allowed values: {', '.join(VALID_REVIEW_MODES)}."
+                        ),
                     },
                     "base_branch": {
                         "type": "string",

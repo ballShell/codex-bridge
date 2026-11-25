@@ -149,10 +149,22 @@ class TestMcpServer(unittest.TestCase):
             self.assertEqual(by_name["codex_run"]["inputSchema"]["required"], ["prompt", "cwd"])
             self.assertEqual(by_name["codex_poll"]["inputSchema"]["required"], ["task_id"])
             self.assertEqual(by_name["codex_review"]["inputSchema"]["required"], ["cwd"])
-            self.assertEqual(
-                by_name["codex_run"]["inputSchema"]["properties"]["sandbox"]["enum"],
-                ["workspace-write", "read-only"],
-            )
+            # Antigravity host MCP loader drops tools whose inputSchema uses "enum";
+            # verify no tool property emits "enum" while allowed values remain documented.
+            for tool in tools:
+                for prop_name, prop_schema in tool["inputSchema"]["properties"].items():
+                    self.assertNotIn(
+                        "enum",
+                        prop_schema,
+                        f"{tool['name']}.{prop_name} must not declare 'enum' in inputSchema",
+                    )
+            sandbox_desc = by_name["codex_run"]["inputSchema"]["properties"]["sandbox"]["description"]
+            self.assertIn("workspace-write", sandbox_desc)
+            self.assertIn("read-only", sandbox_desc)
+            self.assertNotIn("danger-full-access", sandbox_desc)
+            mode_desc = by_name["codex_review"]["inputSchema"]["properties"]["mode"]["description"]
+            for expected_mode in ("uncommitted", "base", "commit", "custom"):
+                self.assertIn(expected_mode, mode_desc)
             for tool_name in ("codex_plan", "codex_run", "codex_review"):
                 self.assertIn("conversation_id", by_name[tool_name]["inputSchema"]["properties"])
         finally:
@@ -177,10 +189,9 @@ class TestMcpServer(unittest.TestCase):
 
             tools_resp = client.request("tools/list")
             tools = {t["name"]: t for t in tools_resp["result"]["tools"]}
-            self.assertEqual(
-                tools["codex_run"]["inputSchema"]["properties"]["sandbox"]["enum"],
-                ["workspace-write", "read-only", "danger-full-access"],
-            )
+            sandbox_schema = tools["codex_run"]["inputSchema"]["properties"]["sandbox"]
+            self.assertNotIn("enum", sandbox_schema)
+            self.assertIn("danger-full-access", sandbox_schema["description"])
         finally:
             rc, _ = client.close()
         self.assertEqual(rc, 0)

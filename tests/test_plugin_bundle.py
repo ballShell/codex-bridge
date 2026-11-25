@@ -154,9 +154,9 @@ class TestPluginBundle(unittest.TestCase):
         tools = codex_cfg.get("tools")
         self.assertIsInstance(tools, dict)
         self.assertEqual(tools.get("codex_status"), {"eager": True, "background": "off"})
-        self.assertEqual(tools.get("codex_plan"), {"eager": True})
-        self.assertEqual(tools.get("codex_run"), {"eager": True})
-        self.assertEqual(tools.get("codex_review"), {"eager": True})
+        self.assertEqual(tools.get("codex_plan"), {"eager": False})
+        self.assertEqual(tools.get("codex_run"), {"eager": False})
+        self.assertEqual(tools.get("codex_review"), {"eager": False})
         self.assertEqual(tools.get("codex_poll"), {"eager": False})
 
         server_tool_names = {tool["name"] for tool in codex_mcp_server._build_tool_definitions()}

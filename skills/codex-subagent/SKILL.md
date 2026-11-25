@@ -9,8 +9,8 @@ Execute targeted user-delegated tasks with Codex cleanly and without unnecessary
 
 ## MCP Reference (`codex-bridge_codex`)
 
-- Eager tools: `codex_status`, `codex_plan`, `codex_run`, `codex_review`.
-- Lazy polling tool: `call_mcp_tool(ServerName="codex-bridge_codex", ToolName="codex_poll", Arguments={"task_id": "<id>", "wait_seconds": 30})`.
+- Eager tool: `codex_status`.
+- Lazy tools (invoked via `call_mcp_tool(ServerName="codex-bridge_codex", ToolName="<tool>", Arguments={...})`): `codex_plan`, `codex_run`, `codex_review`, `codex_poll`.
 
 ## Step 1: Workspace & Readiness Check
 

@@ -14,13 +14,13 @@
           "background": "off"
         },
         "codex_plan": {
-          "eager": true
+          "eager": false
         },
         "codex_run": {
-          "eager": true
+          "eager": false
         },
         "codex_review": {
-          "eager": true
+          "eager": false
         },
         "codex_poll": {
           "eager": false

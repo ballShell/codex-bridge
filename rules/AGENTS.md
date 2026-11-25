@@ -34,5 +34,5 @@ Never forward vague user messages (e.g., `"make auth cleaner"`) verbatim to Code
 
 ## 5. MCP Tools & Post-Run Verification
 
-- **Server `codex-bridge_codex`:** Eager tools `codex_status`, `codex_plan`, `codex_run`, `codex_review`; lazy tool `codex_poll` invoked via `call_mcp_tool(ServerName="codex-bridge_codex", ToolName="codex_poll", Arguments={"task_id": ...})` whenever any call returns `status == "running"`.
+- **Server `codex-bridge_codex`:** Eager tool `codex_status`; lazy tools `codex_plan`, `codex_run`, `codex_review`, `codex_poll` invoked via `call_mcp_tool(ServerName="codex-bridge_codex", ToolName="<tool>", Arguments={...})` (keeps heavy schemas out of Antigravity's eager-tool budget so they are never silently dropped). Whenever any call returns `status == "running"`, poll with `codex_poll(task_id=...)` until completion.
 - **Mandatory Post-Run Translation:** After `codex_run`, inspect `changed_files`, `pre_existing_dirty_files` (never misattribute pre-existing dirty files to Codex), and `diff_stat`. Read key touched files and run quick sanity checks if verification is incomplete, then report in the user's language: **what changed, why, verification evidence, and any open choices or risks**.

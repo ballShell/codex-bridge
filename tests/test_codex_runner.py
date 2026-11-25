@@ -1082,6 +1082,40 @@ class TestCodexTaskManager(unittest.TestCase):
         self.assertEqual(self.manager.get_dashboard_snapshot(conversation_id=conv_a)["stats"]["total_workers"], 0)
         self.assertEqual(self.manager.get_dashboard_snapshot(conversation_id=conv_b)["stats"]["total_workers"], 1)
 
+    def test_running_poll_exposes_idle_ms_and_last_event_at(self) -> None:
+        repo = self._init_git_repo("idle_repo")
+        with mock.patch.dict(os.environ, {"FAKE_CODEX_SLEEP": "1.2"}, clear=False):
+            handle = self.manager.run_exec(
+                prompt="Slow task for idle_ms check",
+                cwd=str(repo),
+                async_mode=True,
+            )
+            self.assertEqual(handle["status"], "running")
+            self.assertEqual(handle["idle_ms"], 0)
+            self.assertIsInstance(handle["last_event_at"], float)
+            launch_event_at = handle["last_event_at"]
+
+            # Wait past the 800ms throttle window so an early event emitted inside
+            # the window is flushed to disk by the deferred timer during silence.
+            time.sleep(0.95)
+            polled = self.manager.poll_task(handle["task_id"], wait_seconds=0)
+            self.assertEqual(polled["status"], "running")
+            self.assertGreaterEqual(polled["progress_events"], 1)
+            self.assertGreater(polled["last_event_at"], launch_event_at)
+            self.assertGreaterEqual(polled["idle_ms"], 100)
+
+            # Cross-process poll reads the deferred-flushed disk state and computes live timings
+            other_mgr = CodexTaskManager(data_dir=self.manager.data_dir)
+            cross_polled = other_mgr.poll_task(handle["task_id"], wait_seconds=0)
+            self.assertEqual(cross_polled["status"], "running")
+            self.assertGreaterEqual(cross_polled["progress_events"], 1)
+            self.assertGreater(cross_polled["last_event_at"], launch_event_at)
+            self.assertGreaterEqual(cross_polled["elapsed_ms"], 800)
+            self.assertGreaterEqual(cross_polled["idle_ms"], 100)
+
+            done = self.manager.poll_task(handle["task_id"], wait_seconds=5)
+            self.assertEqual(done["status"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()
