@@ -127,7 +127,7 @@ app.api(
       const scope = data?.scope === 'all' ? 'all' : 'conversation';
       const limit = Number(data?.limit) || 50;
       const defaultModel = parseSettingsDefaultModel(data?.default_model);
-      store.updateSettings({ default_model: defaultModel });
+      await store.updateSettings({ default_model: defaultModel });
       return await store.getSnapshot({ conversationId: convId, scope, limit });
     } catch (err) {
       console.error('[codex_monitor] /api/settings failed:', err);

@@ -73,6 +73,68 @@ class TestRunnerFoundation(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CODEX_BIN": "/nonexistent/codex-xyz"}, clear=False):
             self.assertIsNone(resolve_codex_bin())
 
+    def test_windows_codex_discovery_parses_npm_cmd_shim(self) -> None:
+        shim_dir = self.tmpdir / "npm bin"
+        shim_dir.mkdir()
+        entry = shim_dir / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+        entry.parent.mkdir(parents=True)
+        entry.write_text("process.exit(0)\n", encoding="utf-8")
+        shim = shim_dir / "codex.cmd"
+        shim.write_text('@ECHO OFF\r\n"%_prog%" "%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n', encoding="utf-8")
+        env = {"CODEX_BIN": str(shim), "PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", "")}
+        with mock.patch.object(codex_runner, "_is_windows", return_value=True):
+            command = codex_runner.resolve_codex_command(env)
+        self.assertIsNotNone(command)
+        self.assertTrue(command[0].lower().endswith("node"))
+        self.assertEqual(Path(command[1]), entry)
+
+    def test_pid_liveness_uses_windows_process_query(self) -> None:
+        with mock.patch.object(codex_runner, "_is_windows", return_value=True), mock.patch("ctypes.WinDLL", create=True) as win_dll:
+            kernel = win_dll.return_value
+            kernel.OpenProcess.return_value = 7
+            kernel.GetExitCodeProcess.return_value = 1
+            kernel.GetExitCodeProcess.side_effect = lambda handle, code: setattr(code._obj, "value", 259) or 1
+            self.assertTrue(codex_runner._is_pid_alive(1234))
+            kernel.CloseHandle.assert_called_once_with(7)
+
+    def test_windows_terminate_process_group_uses_taskkill_with_fallback(self) -> None:
+        # 1. Job Object takes priority and terminates the full process tree cleanly
+        job_proc = mock.MagicMock()
+        job_proc.pid = 4320
+        job_proc._codex_win_job = 99
+        with (
+            mock.patch.object(codex_runner, "_is_windows", return_value=True),
+            mock.patch("ctypes.WinDLL", create=True) as win_dll,
+            mock.patch.object(codex_runner.subprocess, "run") as run_mock,
+        ):
+            kernel = win_dll.return_value
+            kernel.TerminateJobObject.return_value = 1
+            self.assertTrue(codex_runner._terminate_process_group(job_proc, grace_seconds=0.5))
+            kernel.TerminateJobObject.assert_called_once_with(99, 1)
+            kernel.CloseHandle.assert_called_once_with(99)
+            run_mock.assert_not_called()
+
+        # 2. Without a Job Object, taskkill /PID <pid> /T /F terminates the tree
+        fake_proc = mock.MagicMock()
+        fake_proc.pid = 4321
+        fake_proc._codex_win_job = None
+        fake_proc.poll.return_value = None
+        with (
+            mock.patch.object(codex_runner, "_is_windows", return_value=True),
+            mock.patch.object(codex_runner.subprocess, "run", return_value=mock.MagicMock(returncode=0)) as run_mock,
+        ):
+            self.assertTrue(codex_runner._terminate_process_group(fake_proc, grace_seconds=0.5))
+            run_mock.assert_called_once()
+            self.assertEqual(run_mock.call_args.args[0], ["taskkill", "/PID", "4321", "/T", "/F"])
+
+        # 3. If both Job Object and taskkill fail, kill root best-effort and return False (tree unconfirmed)
+        with (
+            mock.patch.object(codex_runner, "_is_windows", return_value=True),
+            mock.patch.object(codex_runner.subprocess, "run", side_effect=OSError("taskkill missing")),
+        ):
+            self.assertFalse(codex_runner._terminate_process_group(fake_proc, grace_seconds=0.2))
+            fake_proc.kill.assert_called_once()
+
     def test_check_status_detects_custom_provider_without_oauth_login(self) -> None:
         codex_home = self.tmpdir / "codex_home"
         codex_home.mkdir()

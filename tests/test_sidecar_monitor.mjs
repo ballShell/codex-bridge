@@ -926,3 +926,31 @@ test('model picker supports ArrowUp/ArrowDown/Escape, outside click, poll focus 
   });
   assert.doesNotMatch(run.finalHtml, /class="model-menu"/);
 });
+
+test('Codex discovery finds macOS GUI user-space bins with a minimal PATH', async () => {
+  const { resolveCodexBin, resolveCodexCommand } = await import('../sidecars/codex_monitor/monitor_store.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'codex gui path-'));
+  try {
+    const candidate = join(root, '.volta', 'bin', 'codex');
+    mkdirSync(dirname(candidate), { recursive: true });
+    writeFileSync(candidate, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    assert.equal(resolveCodexBin({ PATH: '/usr/bin', HOME: root }, 'darwin'), candidate);
+
+    // Windows npm shim (%dp0% and %~dp0) resolves to [node, jsEntry] while unknown .cmd is rejected
+    const npmDir = join(root, 'npm-win');
+    const jsEntry = join(npmDir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+    mkdirSync(dirname(jsEntry), { recursive: true });
+    writeFileSync(jsEntry, 'console.log("ok");\n', 'utf8');
+    const shim = join(npmDir, 'codex.cmd');
+    writeFileSync(shim, '@ECHO off\r\n"%_prog%" "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n', 'utf8');
+    const cmd = resolveCodexCommand({ CODEX_BIN: shim, PATH: npmDir }, 'win32');
+    assert.ok(cmd);
+    assert.equal(cmd[1], jsEntry);
+
+    const badShim = join(npmDir, 'unknown.cmd');
+    writeFileSync(badShim, '@echo off\r\necho arbitrary\r\n', 'utf8');
+    assert.equal(resolveCodexCommand({ CODEX_BIN: badShim, PATH: npmDir }, 'win32'), null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

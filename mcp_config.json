@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "codex": {
-      "command": "python3",
+      "command": "node",
       "args": [
-        "${PLUGIN_ROOT}/scripts/codex_mcp_server.py",
+        "${PLUGIN_ROOT}/scripts/launch_mcp.mjs",
         "--data-dir",
         "${PLUGIN_DATA}"
       ],

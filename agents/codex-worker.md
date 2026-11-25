@@ -4,8 +4,7 @@ description: "Background Antigravity subagent that executes a bounded read-only 
 subagent: true
 mainAgent: false
 inheritMcp: true
-model: flash
-tools: [read_file, call_mcp_tool, send_message]
+tools: [read_file, send_message]
 ---
 
 # Codex Worker Subagent
@@ -30,7 +29,7 @@ Because v1 runs directly inside the shared target `cwd` without Git worktree iso
 
 ## Tool Usage (`codex-bridge_codex`)
 
-Invoke tools on `ServerName="codex-bridge_codex"` via `call_mcp_tool` (or directly if eager tools are injected into your toolset via `inheritMcp: true`):
+Invoke the inherited `codex_status`, `codex_plan`, `codex_run`, `codex_review`, and `codex_poll` MCP tools directly when Antigravity exposes them:
 
 - `codex_status`: `{ "cwd": "<abs_cwd>" }` — check binary, auth, and Git state if readiness is uncertain or an error occurs.
 - `codex_plan`: `{ "prompt": "...", "cwd": "<abs_cwd>", "max_duration_seconds": 300, ... }` — strict read-only analysis/planning (optional: `model`, `reasoning_effort`, `images`, `wait_seconds`, `max_duration_seconds`, `max_idle_seconds`).

@@ -139,10 +139,10 @@ class TestPluginBundle(unittest.TestCase):
         self.assertIn("codex", servers)
         codex_cfg = servers["codex"]
 
-        self.assertEqual(codex_cfg.get("command"), "python3")
+        self.assertEqual(codex_cfg.get("command"), "node")
         self.assertEqual(
             codex_cfg.get("args"),
-            ["${PLUGIN_ROOT}/scripts/codex_mcp_server.py", "--data-dir", "${PLUGIN_DATA}"],
+            ["${PLUGIN_ROOT}/scripts/launch_mcp.mjs", "--data-dir", "${PLUGIN_DATA}"],
         )
         self.assertEqual(codex_cfg.get("timeoutSeconds"), 900)
 
@@ -195,10 +195,10 @@ class TestPluginBundle(unittest.TestCase):
         self.assertIs(meta.get("subagent"), True)
         self.assertIs(meta.get("mainAgent"), False)
         self.assertIs(meta.get("inheritMcp"), True)
-        self.assertEqual(meta.get("tools"), ["read_file", "call_mcp_tool", "send_message"])
+        self.assertEqual(meta.get("tools"), ["read_file", "send_message"])
 
     def test_scripts_have_executable_permissions(self) -> None:
-        for script_name in ("codex_mcp_server.py", "codex_runner.py", "codex_hook.py"):
+        for script_name in ("codex_mcp_server.py", "codex_runner.py", "codex_hook.py", "launch_mcp.mjs", "codex_hook.mjs", "file_lock.py", "file_lock.mjs"):
             script_path = SCRIPTS_DIR / script_name
             self.assertTrue(script_path.is_file(), f"Missing scripts/{script_name}")
             mode = stat.S_IMODE(script_path.stat().st_mode)
@@ -215,6 +215,7 @@ class TestPluginBundle(unittest.TestCase):
         pre_tool_use = tracker.get("PreToolUse")
         self.assertIsInstance(pre_tool_use, list)
         self.assertTrue(len(pre_tool_use) >= 1)
+        self.assertEqual(pre_tool_use[0]["hooks"][0]["command"], "node scripts/codex_hook.mjs")
 
         sidecar_dir = REPO_ROOT / "sidecars" / "codex_monitor"
         self.assertTrue(sidecar_dir.is_dir(), "Missing sidecars/codex_monitor")
@@ -298,6 +299,18 @@ class TestPluginBundle(unittest.TestCase):
         self.assertIn("MIT License", text)
         self.assertIn("Copyright (c) 2026 ballShell", text)
         self.assertIn("Permission is hereby granted, free of charge", text)
+
+
+    def test_antigravity_desktop_entrypoint_contract(self) -> None:
+        mcp = json.loads((REPO_ROOT / "mcp_config.json").read_text(encoding="utf-8"))["mcpServers"]["codex"]
+        self.assertEqual(mcp["command"], "node")
+        self.assertEqual(mcp["args"], ["${PLUGIN_ROOT}/scripts/launch_mcp.mjs", "--data-dir", "${PLUGIN_DATA}"])
+        hooks = json.loads((REPO_ROOT / "hooks.json").read_text(encoding="utf-8"))
+        command = hooks["codex-conversation-tracker"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertEqual(command, "node scripts/codex_hook.mjs")
+        agent = _parse_yaml_frontmatter((REPO_ROOT / "agents/codex-worker.md").read_text(encoding="utf-8"))
+        self.assertEqual(agent["tools"], ["read_file", "send_message"])
+        self.assertNotIn("model", agent)
 
 
 if __name__ == "__main__":

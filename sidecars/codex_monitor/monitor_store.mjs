@@ -19,6 +19,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
+import { withFileLockSync, atomicWriteTextSync } from '../../scripts/file_lock.mjs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 
 export const SAFE_ID_RE = /^[A-Za-z0-9_-]{8,}$/;
@@ -34,6 +35,7 @@ const PREFLIGHT_TIMEOUT_MS = 5_000;
 const MAX_CLI_SESSION_FILES = 25;
 const MAX_SUBAGENT_DEPTH = 3;
 const FALLBACK_CODEX_BINS = ['/opt/homebrew/bin/codex', '/usr/local/bin/codex'];
+const MAC_USER_BIN_SUFFIXES = ['.nvm/versions/node/*/bin', '.fnm/node-versions/*/installation/bin', '.volta/bin', '.local/share/mise/shims', '.asdf/shims', '.npm-global/bin', '.bun/bin'];
 
 export function resolvePaths(env = process.env) {
   let appDataDir = '';
@@ -55,9 +57,9 @@ export function resolvePaths(env = process.env) {
 
   const brainDir = (env.CODEX_BRIDGE_BRAIN_DIR || '').trim() || join(appDataDir, 'brain');
   const pluginDataDir =
-    (env.CODEX_BRIDGE_DATA_DIR || '').trim() || join(appDataDir, 'plugin_data', 'codex-bridge');
+    (env.CODEX_BRIDGE_DATA_DIR || env.PLUGIN_DATA || '').trim() || join(appDataDir, 'plugin_data', 'codex-bridge');
   const tasksDir = join(pluginDataDir, 'tasks');
-  const codexHomeDir = (env.CODEX_HOME || '').trim() || join(homedir(), '.codex');
+  const codexHomeDir = (env.CODEX_HOME || '').trim() || join(env.USERPROFILE || env.HOME || homedir(), '.codex');
 
   return { appDataDir, brainDir, pluginDataDir, tasksDir, codexHomeDir };
 }
@@ -199,13 +201,11 @@ export function writePluginSettings(pluginDataDir, { default_model = null } = {}
 
   mkdirSync(pluginDataDir, { recursive: true });
   const settingsPath = join(pluginDataDir, SETTINGS_FILENAME);
-  const tmpPath = join(pluginDataDir, `.${SETTINGS_FILENAME}.${randomUUID().slice(0, 8)}.tmp`);
   const payload = {
     default_model: cleanModel,
     updated_at: Date.now() / 1000,
   };
-  writeFileSync(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-  renameSync(tmpPath, settingsPath);
+  withFileLockSync(settingsPath, () => atomicWriteTextSync(settingsPath, `${JSON.stringify(payload, null, 2)}\n`));
   return {
     default_model: cleanModel,
     source: cleanModel ? 'plugin' : 'codex',
@@ -267,52 +267,88 @@ export function readAvailableCodexModels(codexHomeDir, defaults = null, pluginDe
   return models;
 }
 
-function isExecutable(filePath) {
+function candidateExists(filePath, windows = process.platform === 'win32') {
   try {
     const st = statSync(filePath);
     if (!st.isFile()) return false;
-    accessSync(filePath, fsConstants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
+    return windows || accessSync(filePath, fsConstants.X_OK) === undefined;
+  } catch { return false; }
 }
 
-export function resolveCodexBin(env = process.env) {
+function parseWindowsNpmShim(shimPath, env) {
+  let source;
+  try { source = readFileSync(shimPath, 'utf8'); } catch { return null; }
+  const match = source.match(/^\s*@?\s*(?:"?%_prog%"?\s+)?"?([^"\r\n]*?\.js)"?(?:\s+%\*)?\s*$/im)
+    || source.match(/^\s*@?\s*node(?:\.exe)?\s+"?([^"\r\n]*?\.js)"?/im);
+  if (!match) return null;
+  const entry = match[1]
+    .replace(/%~dp0/ig, `${dirname(shimPath)}/`)
+    .replace(/%dp0%/ig, dirname(shimPath))
+    .replace(/\\/g, '/');
+  const jsPath = isAbsolute(entry) ? entry : join(dirname(shimPath), entry);
+  const node = (env.PATH || '').split(';').map((dir) => join(dir, 'node.exe')).find((path) => candidateExists(path, true)) || 'node';
+  return candidateExists(jsPath, true) ? [node, jsPath] : null;
+}
+
+export function resolveCodexCommand(env = process.env, platformName = process.platform) {
+  const windows = platformName === 'win32';
   const override = (env.CODEX_BIN || '').trim();
+  const separator = windows ? ';' : ':';
+  const pathDirs = (env.PATH || '').split(separator).filter(Boolean);
+  const candidates = [];
   if (override) {
-    if (override.includes('/') || override.includes('\\') || existsSync(override)) {
-      return isExecutable(override) ? override : null;
+    if (override.includes('/') || override.includes('\\')) candidates.push(override);
+    else for (const dir of pathDirs) {
+      candidates.push(join(dir, override));
+      if (windows && !/\.(exe|cmd|bat)$/i.test(override)) for (const ext of ['.exe', '.cmd', '.bat']) candidates.push(join(dir, override + ext));
     }
-    const pathDirs = (env.PATH || '').split(process.platform === 'win32' ? ';' : ':');
+  } else {
     for (const dir of pathDirs) {
-      if (!dir) continue;
-      const cand = join(dir, override);
-      if (isExecutable(cand)) return cand;
+      candidates.push(join(dir, windows ? 'codex.exe' : 'codex'));
+      if (windows) for (const ext of ['.cmd', '.bat']) candidates.push(join(dir, `codex${ext}`));
     }
-    return null;
+    if (!windows) {
+      const home = env.HOME || homedir();
+      for (const suffix of MAC_USER_BIN_SUFFIXES) {
+        if (!suffix.includes('*')) {
+          candidates.push(join(home, suffix, 'codex'));
+          continue;
+        }
+        const [prefix, tail] = suffix.split('*');
+        const parent = join(home, prefix);
+        try {
+          for (const entry of readdirSync(parent, { withFileTypes: true })) {
+            if (entry.isDirectory()) candidates.push(join(parent, entry.name, tail, 'codex'));
+          }
+        } catch { /* optional version-managed runtimes */ }
+      }
+      candidates.push(...FALLBACK_CODEX_BINS);
+    } else if (env.APPDATA) {
+      for (const ext of ['.exe', '.cmd', '.bat']) candidates.push(join(env.APPDATA, 'npm', `codex${ext}`));
+    }
   }
-
-  const pathDirs = (env.PATH || '').split(process.platform === 'win32' ? ';' : ':');
-  const binName = process.platform === 'win32' ? 'codex.exe' : 'codex';
-  for (const dir of pathDirs) {
-    if (!dir) continue;
-    const cand = join(dir, binName);
-    if (isExecutable(cand)) return cand;
-  }
-
-  for (const fallback of FALLBACK_CODEX_BINS) {
-    if (isExecutable(fallback)) return fallback;
+  for (const path of [...new Set(candidates)]) {
+    if (!candidateExists(path, windows)) continue;
+    if (windows && /\.(cmd|bat)$/i.test(path)) {
+      const command = parseWindowsNpmShim(path, env);
+      if (command) return command;
+      continue;
+    }
+    return [path];
   }
   return null;
 }
 
-function execCommand(cmd, args, timeoutMs = PREFLIGHT_TIMEOUT_MS) {
+export function resolveCodexBin(env = process.env, platformName = process.platform) {
+  return resolveCodexCommand(env, platformName)?.at(-1) || null;
+}
+
+function execCommand(cmd, args, timeoutMs = PREFLIGHT_TIMEOUT_MS, env = process.env) {
   return new Promise((resolve) => {
     execFile(
       cmd,
       args,
-      { timeout: timeoutMs, windowsHide: true, encoding: 'utf8', maxBuffer: 1024 * 1024 },
+      { env, timeout: timeoutMs, windowsHide: true, encoding: 'utf8', maxBuffer: 1024 * 1024 },
       (err, stdout, stderr) => {
         resolve({
           ok: !err,
@@ -324,6 +360,11 @@ function execCommand(cmd, args, timeoutMs = PREFLIGHT_TIMEOUT_MS) {
       }
     );
   });
+}
+
+function execCodex(args, env) {
+  const command = resolveCodexCommand(env);
+  return command ? execCommand(command[0], [...command.slice(1), ...args], PREFLIGHT_TIMEOUT_MS, env) : Promise.resolve({ ok: false, code: 1, stdout: '', stderr: '', errName: 'NotFound' });
 }
 
 function nonnegInt(val) {
@@ -391,8 +432,8 @@ export function createMonitorStore(env = process.env) {
 
     if (codexBin) {
       const [verRes, loginRes] = await Promise.all([
-        execCommand(codexBin, ['--version']),
-        execCommand(codexBin, ['login', 'status']),
+        execCodex(['--version'], env),
+        execCodex(['login', 'status'], env),
       ]);
       if (verRes.ok && verRes.stdout.trim()) {
         version = verRes.stdout.trim().split(/\r?\n/)[0].trim();
@@ -633,21 +674,19 @@ export function createMonitorStore(env = process.env) {
       const ownerDead = ownerPid === undefined || ownerPid === null || !isPidAlive(ownerPid);
       if (pidDead && ownerDead) {
         try {
-          const latest = JSON.parse(readFileSync(taskPath, 'utf8'));
-          if (latest && latest.status !== 'running') {
-            return latest;
-          }
-          const failedRecord = {
-            ...latest,
-            status: 'failed',
-            activity: 'failed',
-            finished_at: latest.finished_at || Date.now() / 1000,
-            error: 'Background task process is no longer running.',
-          };
-          const tmpPath = join(tasksDir, `.${basename(taskPath)}.${randomUUID().slice(0, 8)}.tmp`);
-          writeFileSync(tmpPath, JSON.stringify(failedRecord, null, 2) + '\n', 'utf8');
-          renameSync(tmpPath, taskPath);
-          return failedRecord;
+          return withFileLockSync(taskPath, () => {
+            const latest = JSON.parse(readFileSync(taskPath, 'utf8'));
+            if (latest && latest.status !== 'running') return latest;
+            const failedRecord = {
+              ...latest,
+              status: 'failed',
+              activity: 'failed',
+              finished_at: latest.finished_at || Date.now() / 1000,
+              error: 'Background task process is no longer running.',
+            };
+            atomicWriteTextSync(taskPath, JSON.stringify(failedRecord, null, 2) + '\n');
+            return failedRecord;
+          });
         } catch {
           return {
             ...record,

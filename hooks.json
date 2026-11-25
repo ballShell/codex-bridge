@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ./scripts/codex_hook.py",
+            "command": "node scripts/codex_hook.mjs",
             "timeout": 5
           }
         ]

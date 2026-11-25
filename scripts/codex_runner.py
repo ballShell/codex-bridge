@@ -11,17 +11,25 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+from file_lock import atomic_write_text, file_lock
 from typing import Any
 
 VALID_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 VALID_REVIEW_MODES = ("uncommitted", "base", "commit", "custom")
 FALLBACK_CODEX_PATHS = ("/opt/homebrew/bin/codex", "/usr/local/bin/codex")
+MAC_USER_BIN_SUFFIXES = (
+    ".nvm/versions/node/*/bin", ".fnm/node-versions/*/installation/bin", ".volta/bin",
+    ".local/share/mise/shims", ".asdf/shims", ".npm-global/bin", ".bun/bin",
+)
+
 PREFLIGHT_TIMEOUT_SECONDS = 5
 DEFAULT_WAIT_SECONDS = 120
 DEFAULT_POLL_WAIT_SECONDS = 30
@@ -48,26 +56,85 @@ class CodexRunnerError(ValueError):
     """Raised when runner validation or preflight requirements fail."""
 
 
-def resolve_codex_bin() -> str | None:
-    """Resolve the Codex CLI executable path or return None if unavailable."""
-    override = os.environ.get("CODEX_BIN", "").strip()
-    if override:
-        candidate = Path(override).expanduser()
-        if os.path.sep in override or candidate.exists():
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return str(candidate)
-            return None
-        return shutil.which(override)
+def _is_windows() -> bool:
+    return os.name == "nt"
 
-    which_path = shutil.which("codex")
-    if which_path:
-        return which_path
 
-    for fallback in FALLBACK_CODEX_PATHS:
-        if os.path.isfile(fallback) and os.access(fallback, os.X_OK):
-            return fallback
+def _candidate_paths(env: dict[str, str] | os._Environ[str] | None = None) -> list[Path]:
+    env = env or os.environ
+    path_sep = ";" if _is_windows() else os.pathsep
+    candidates: list[Path] = []
+    for directory in (env.get("PATH", "").split(path_sep)):
+        if directory:
+            candidates.append(Path(directory) / ("codex" if not _is_windows() else "codex.exe"))
+            if _is_windows():
+                for extension in env.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";"):
+                    if extension.lower() in (".exe", ".cmd", ".bat"):
+                        candidates.append(Path(directory) / f"codex{extension.lower()}")
+    home = Path(env.get("USERPROFILE") or env.get("HOME") or str(Path.home()))
+    if not _is_windows():
+        for suffix in MAC_USER_BIN_SUFFIXES:
+            pattern = str(home / suffix / "codex")
+            candidates.extend(Path(match) for match in sorted(__import__("glob").glob(pattern)))
+        candidates.extend(Path(path) for path in FALLBACK_CODEX_PATHS)
+    else:
+        appdata = env.get("APPDATA", "")
+        if appdata:
+            for ext in (".exe", ".cmd", ".bat"):
+                candidates.append(Path(appdata) / "npm" / f"codex{ext}")
+    return candidates
 
+
+def resolve_codex_command(env: dict[str, str] | os._Environ[str] | None = None) -> list[str] | None:
+    env = env or os.environ
+    override = env.get("CODEX_BIN", "").strip()
+    has_path = "/" in override or "\\" in override
+    candidates = [Path(override).expanduser()] if override and has_path else []
+    if override and not candidates:
+        path_dirs = [Path(p) for p in env.get("PATH", "").split(";" if _is_windows() else os.pathsep) if p]
+        for directory in path_dirs:
+            candidates.append(directory / override)
+            if _is_windows() and not re.search(r"\.(exe|cmd|bat|com)$", override, re.IGNORECASE):
+                for ext in (".exe", ".cmd", ".bat"):
+                    candidates.append(directory / f"{override}{ext}")
+    if not override:
+        candidates = _candidate_paths(env)
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            suffix = candidate.suffix.lower()
+            if not _is_windows():
+                if os.access(candidate, os.X_OK):
+                    return [str(candidate)]
+                continue
+            if suffix in (".cmd", ".bat"):
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+                match = re.search(r'(?im)^\s*@?\s*\"?%_prog%\"?\s+\"?([^\"\r\n]*\.js)\"?\s+%\*', text)
+                if not match:
+                    match = re.search(r'(?im)^\s*@?\s*node(?:\.exe)?\s+\"?([^\"\r\n]*\.js)\"?', text)
+                if not match:
+                    continue
+                raw_entry = match.group(1).replace("%~dp0", str(candidate.parent) + os.sep).replace("%dp0%", str(candidate.parent)).replace("\\", os.sep)
+                js_entry = Path(raw_entry)
+                if not js_entry.is_absolute():
+                    js_entry = (candidate.parent / js_entry).resolve()
+                if not js_entry.is_file():
+                    continue
+                node = shutil.which("node", path=env.get("PATH"))
+                if not node:
+                    continue
+                return [node, str(js_entry)]
+            if suffix in (".exe", "", ".com"):
+                return [str(candidate)]
+        except OSError:
+            continue
     return None
+
+
+def resolve_codex_bin() -> str | None:
+    command = resolve_codex_command()
+    return command[-1] if command else None
 
 
 def validate_cwd(cwd: str) -> Path:
@@ -128,7 +195,8 @@ def _strip_toml_inline_comment(raw_value: str) -> str:
 
 def _get_codex_home_dir() -> Path:
     codex_home = os.environ.get("CODEX_HOME", "").strip()
-    return Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
+    home = os.environ.get("USERPROFILE") or os.environ.get("HOME") or str(Path.home())
+    return Path(codex_home).expanduser() if codex_home else Path(home).expanduser() / ".codex"
 
 
 def _unquote_toml_string(raw_val: str) -> str | None:
@@ -222,9 +290,10 @@ def check_auth_state(codex_bin: str | None) -> dict[str, Any]:
     login_status_text: str | None = None
 
     if codex_bin:
+        cmd = resolve_codex_command() or [codex_bin]
         try:
             proc = subprocess.run(
-                [codex_bin, "login", "status"],
+                [*cmd, "login", "status"],
                 capture_output=True,
                 text=True,
                 timeout=PREFLIGHT_TIMEOUT_SECONDS,
@@ -324,9 +393,10 @@ def check_status(cwd: str | None = None, data_dir: str | Path | None = None) -> 
 
     version: str | None = None
     if codex_bin:
+        cmd = resolve_codex_command() or [codex_bin]
         try:
             ver_proc = subprocess.run(
-                [codex_bin, "--version"],
+                [*cmd, "--version"],
                 capture_output=True,
                 text=True,
                 timeout=PREFLIGHT_TIMEOUT_SECONDS,
@@ -838,6 +908,8 @@ def _inject_time_budget_prompt(
 def _is_pgid_alive(pgid: int) -> bool:
     if pgid <= 0:
         return False
+    if _is_windows():
+        return _is_pid_alive(pgid)
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -849,47 +921,170 @@ def _is_pgid_alive(pgid: int) -> bool:
     return True
 
 
-def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) -> bool:
-    """Terminate a child process group cleanly (SIGTERM -> brief grace -> SIGKILL).
+def _attach_windows_job(proc: subprocess.Popen) -> Any | None:
+    """Attach a spawned Windows child process to a Job Object with KILL_ON_JOB_CLOSE."""
+    if not _is_windows():
+        return None
+    proc_handle = getattr(proc, "_handle", None)
+    if not proc_handle:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
 
-    Returns True if a signal was actually delivered to a live process or process group
-    (including surviving descendants after leader exit), False if already gone.
-    """
-    pgid = proc.pid
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+        kernel.SetInformationJobObject.restype = wintypes.BOOL
+        kernel.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+
+        job = kernel.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            kernel.CloseHandle(job)
+            return None
+        if not kernel.AssignProcessToJobObject(job, int(proc_handle)):
+            kernel.CloseHandle(job)
+            return None
+        setattr(proc, "_codex_win_job", job)
+        return job
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _close_windows_job(proc: subprocess.Popen | None) -> None:
+    if proc is None:
+        return
+    job = getattr(proc, "_codex_win_job", None)
+    if not job:
+        return
+    setattr(proc, "_codex_win_job", None)
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+        kernel.CloseHandle(job)
+    except (AttributeError, OSError):
+        pass
+
+
+def _terminate_windows_job(proc: subprocess.Popen) -> bool:
+    job = getattr(proc, "_codex_win_job", None)
+    if not job:
+        return False
+    terminated = False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel.TerminateJobObject.restype = wintypes.BOOL
+        terminated = bool(kernel.TerminateJobObject(job, 1))
+    except (AttributeError, OSError):
+        terminated = False
+    finally:
+        _close_windows_job(proc)
+    return terminated
+
+
+def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) -> bool:
+    if _is_windows():
+        if _terminate_windows_job(proc):
+            try:
+                proc.wait(timeout=max(0.2, grace_seconds))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            return True
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True, timeout=max(1.0, grace_seconds + 1.0), check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0:
+                try:
+                    proc.wait(timeout=max(0.2, grace_seconds))
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=max(0.2, grace_seconds))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        # Tree termination could not be confirmed when both Job Object and taskkill failed.
+        return False
+
     signaled = False
     try:
-        os.killpg(pgid, signal.SIGTERM)
+        os.killpg(proc.pid, signal.SIGTERM)
         signaled = True
-    except ProcessLookupError:
+    except (ProcessLookupError, OSError):
         if proc.poll() is None:
             try:
                 proc.terminate()
                 signaled = True
             except OSError:
                 pass
-    except OSError:
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                signaled = True
-            except OSError:
-                pass
-
-    if not signaled and proc.poll() is not None and not _is_pgid_alive(pgid):
+    if not signaled and proc.poll() is not None and not _is_pgid_alive(proc.pid):
         return False
 
     deadline = time.monotonic() + max(0.1, grace_seconds)
     while time.monotonic() < deadline:
-        if proc.poll() is not None and not _is_pgid_alive(pgid):
+        if proc.poll() is not None and not _is_pgid_alive(proc.pid):
             return signaled
         time.sleep(0.05)
-
-    if proc.poll() is None or _is_pgid_alive(pgid):
+    if proc.poll() is None or _is_pgid_alive(proc.pid):
         try:
-            os.killpg(pgid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)
             signaled = True
-        except ProcessLookupError:
-            pass
         except OSError:
             pass
         if proc.poll() is None:
@@ -900,16 +1095,36 @@ def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) ->
                 pass
         kill_deadline = time.monotonic() + 0.5
         while time.monotonic() < kill_deadline:
-            if proc.poll() is not None and not _is_pgid_alive(pgid):
+            if proc.poll() is not None and not _is_pgid_alive(proc.pid):
                 break
             time.sleep(0.05)
-
     return signaled
 
 
 def _is_pid_alive(pid: Any) -> bool:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return False
+    if _is_windows():
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+            kernel.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel.CloseHandle.restype = wintypes.BOOL
+            handle = kernel.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return ctypes.get_last_error() == 5
+            try:
+                code = ctypes.c_ulong()
+                return bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+            finally:
+                kernel.CloseHandle(handle)
+        except (AttributeError, OSError):
+            return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -976,7 +1191,7 @@ class CodexTaskManager:
         base_dir = (
             Path(data_dir).expanduser()
             if data_dir is not None
-            else Path.home() / ".cache" / "codex-bridge"
+            else Path(os.environ.get("CODEX_BRIDGE_DATA_DIR") or os.environ.get("PLUGIN_DATA") or Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or str(Path.home())) / ".cache" / "codex-bridge").expanduser()
         )
         self.data_dir = base_dir
         self.tasks_dir = self.data_dir / "tasks"
@@ -1004,6 +1219,7 @@ class CodexTaskManager:
         clean_prompt = _require_non_empty_str(prompt, "prompt")
         cwd_path = validate_cwd(cwd)
         codex_bin = _require_codex_bin()
+        codex_command = resolve_codex_command()
         clean_model = _normalize_optional_str(model, "model")
         clean_effort = _normalize_optional_str(reasoning_effort, "reasoning_effort")
         clean_conv_id = _normalize_optional_str(conversation_id, "conversation_id")
@@ -1027,7 +1243,7 @@ class CodexTaskManager:
 
         def build_cmd(last_msg_path: Path) -> list[str]:
             cmd = [
-                codex_bin,
+                *codex_command,
                 "exec",
                 "--json",
                 "-s",
@@ -1083,6 +1299,7 @@ class CodexTaskManager:
         cwd_path = validate_cwd(cwd)
         validated_sandbox = validate_sandbox(sandbox)
         codex_bin = _require_codex_bin()
+        codex_command = resolve_codex_command()
         clean_model = _normalize_optional_str(model, "model")
         clean_effort = _normalize_optional_str(reasoning_effort, "reasoning_effort")
         clean_conv_id = _normalize_optional_str(conversation_id, "conversation_id")
@@ -1121,7 +1338,7 @@ class CodexTaskManager:
             if is_resume:
                 assert clean_session_id is not None
                 cmd = [
-                    codex_bin,
+                    *codex_command,
                     "exec",
                     "resume",
                     clean_session_id,
@@ -1133,7 +1350,7 @@ class CodexTaskManager:
                 ]
             else:
                 cmd = [
-                    codex_bin,
+                    *codex_command,
                     "exec",
                     "--json",
                     "-s",
@@ -1195,6 +1412,7 @@ class CodexTaskManager:
             )
         cwd_path = validate_cwd(cwd)
         codex_bin = _require_codex_bin()
+        codex_command = resolve_codex_command()
         clean_base = _normalize_optional_str(base_branch, "base_branch")
         clean_commit = _normalize_optional_str(commit_sha, "commit_sha")
         clean_title = _normalize_optional_str(title, "title")
@@ -1257,7 +1475,7 @@ class CodexTaskManager:
                     max_idle_seconds=effective_idle,
                 )
                 cmd = [
-                    codex_bin,
+                    *codex_command,
                     "exec",
                     "--json",
                     "-s",
@@ -1279,7 +1497,7 @@ class CodexTaskManager:
                 return cmd
 
             cmd = [
-                codex_bin,
+                *codex_command,
                 "exec",
                 "review",
                 "--json",
@@ -1438,7 +1656,7 @@ class CodexTaskManager:
     ) -> str | None:
         """Consume the best matching recent PreToolUse correlation record, if any."""
         pending_path = self.data_dir / "pending_calls.jsonl"
-        with self._pending_lock:
+        with self._pending_lock, file_lock(pending_path):
             if not pending_path.is_file():
                 return None
             try:
@@ -1498,12 +1716,10 @@ class CodexTaskManager:
 
             try:
                 if fresh:
-                    tmp_path = self.data_dir / f".pending_calls.{uuid.uuid4().hex[:8]}.tmp"
-                    tmp_path.write_text(
+                    atomic_write_text(
+                        pending_path,
                         "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in fresh),
-                        encoding="utf-8",
                     )
-                    os.replace(tmp_path, pending_path)
                 elif pending_path.exists():
                     pending_path.unlink()
             except OSError:
@@ -1586,9 +1802,12 @@ class CodexTaskManager:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
                 bufsize=1,
-                start_new_session=True,
+                start_new_session=not _is_windows(),
+                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if _is_windows() else 0,
             )
+            _attach_windows_job(proc)
         except Exception as exc:
             try:
                 tmp_dir.cleanup()
@@ -1912,7 +2131,7 @@ class CodexTaskManager:
 
             stdout_thread.join(timeout=2.0)
             stderr_thread.join(timeout=2.0)
-            if (stdout_thread.is_alive() or stderr_thread.is_alive()) and _is_pgid_alive(proc.pid):
+            if (stdout_thread.is_alive() or stderr_thread.is_alive()) and (_is_windows() or _is_pgid_alive(proc.pid)):
                 _terminate_process_group(proc, grace_seconds=0.3)
                 stdout_thread.join(timeout=1.0)
                 stderr_thread.join(timeout=1.0)
@@ -2102,6 +2321,7 @@ class CodexTaskManager:
                     pass
         finally:
             task.watchdog_stop.set()
+            _close_windows_job(proc)
             for stream, reader in ((proc.stdout, stdout_thread), (proc.stderr, stderr_thread)):
                 if stream is not None and not stream.closed and (reader is None or not reader.is_alive()):
                     try:
@@ -2161,9 +2381,8 @@ class CodexTaskManager:
 
     def _write_task_file(self, task_path: Path, payload: dict[str, Any]) -> None:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.tasks_dir / f".{task_path.name}.{uuid.uuid4().hex[:8]}.tmp"
-        tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp_path, task_path)
+        with file_lock(task_path):
+            atomic_write_text(task_path, json.dumps(payload, indent=2) + "\n")
 
     def _read_persisted_task(self, task_path: Path) -> dict[str, Any]:
         try:

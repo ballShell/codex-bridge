@@ -7,9 +7,10 @@ import json
 import os
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Any
+
+from file_lock import atomic_write_text, file_lock
 
 MAX_PENDING_AGE_SECONDS = 60.0
 MAX_PENDING_ENTRIES = 200
@@ -117,38 +118,32 @@ def record_pending_call(entry: dict[str, Any], data_dir: Path | None = None, now
     pending_path = target_dir / "pending_calls.jsonl"
     ts_now = now if now is not None else time.time()
 
-    fresh_entries: list[dict[str, Any]] = []
-    if pending_path.is_file():
-        try:
-            for line in pending_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    item = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(item, dict) and isinstance(item.get("ts"), (int, float)):
-                    if (ts_now - float(item["ts"])) <= MAX_PENDING_AGE_SECONDS:
-                        fresh_entries.append(item)
-        except OSError:
-            fresh_entries = []
-
-    record = {
-        "ts": ts_now,
-        "conversation_id": entry["conversation_id"],
-        "mode": entry["mode"],
-        "cwd": entry.get("cwd"),
-        "prompt_preview": entry.get("prompt_preview"),
-    }
-    fresh_entries.append(record)
-    if len(fresh_entries) > MAX_PENDING_ENTRIES:
-        fresh_entries = fresh_entries[-MAX_PENDING_ENTRIES:]
-
-    tmp_path = target_dir / f".pending_calls.{uuid.uuid4().hex[:8]}.tmp"
-    content = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in fresh_entries)
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, pending_path)
+    with file_lock(pending_path):
+        fresh_entries: list[dict[str, Any]] = []
+        if pending_path.is_file():
+            try:
+                for line in pending_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(item, dict) and isinstance(item.get("ts"), (int, float)):
+                        if (ts_now - float(item["ts"])) <= MAX_PENDING_AGE_SECONDS:
+                            fresh_entries.append(item)
+            except OSError:
+                fresh_entries = []
+        record = {
+            "ts": ts_now,
+            "conversation_id": entry["conversation_id"],
+            "mode": entry["mode"],
+            "cwd": entry.get("cwd"),
+            "prompt_preview": entry.get("prompt_preview"),
+        }
+        fresh_entries.append(record)
+        if len(fresh_entries) > MAX_PENDING_ENTRIES:
+            fresh_entries = fresh_entries[-MAX_PENDING_ENTRIES:]
+        content = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in fresh_entries)
+        atomic_write_text(pending_path, content)
     return pending_path
 
 
@@ -166,6 +161,10 @@ def process_hook_input(raw_text: str, data_dir: Path | None = None) -> dict[str,
 
 
 def main() -> int:
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     try:
         raw_text = sys.stdin.read()
     except Exception:
