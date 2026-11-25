@@ -40,6 +40,8 @@ DEFAULT_DASHBOARD_LIMIT = 50
 MAX_DASHBOARD_LIMIT = 200
 MAX_CLI_SESSION_FILES = 25
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$")
+SETTINGS_FILENAME = "settings.json"
 
 
 class CodexRunnerError(ValueError):
@@ -173,6 +175,42 @@ def read_codex_config_defaults() -> dict[str, str | None]:
     return defaults
 
 
+def _sanitize_model_id(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned or not MODEL_ID_PATTERN.fullmatch(cleaned):
+        return None
+    return cleaned
+
+
+def read_plugin_settings(data_dir: str | Path | None = None) -> dict[str, Any]:
+    """Read lightweight plugin-isolated settings from <data_dir>/settings.json (with env fallback)."""
+    result: dict[str, Any] = {
+        "default_model": None,
+        "source": "codex",
+    }
+    if data_dir is not None:
+        settings_path = Path(data_dir).expanduser() / SETTINGS_FILENAME
+        if settings_path.is_file():
+            try:
+                parsed = json.loads(settings_path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                configured = _sanitize_model_id(parsed.get("default_model"))
+                if configured is not None:
+                    result["default_model"] = configured
+                    result["source"] = "plugin"
+                    return result
+
+    env_model = _sanitize_model_id(os.environ.get("CODEX_BRIDGE_DEFAULT_MODEL", ""))
+    if env_model is not None:
+        result["default_model"] = env_model
+        result["source"] = "env"
+    return result
+
+
 def _detect_custom_provider() -> str | None:
     """Inspect $CODEX_HOME/config.toml (or ~/.codex/config.toml) for model_provider without reading secrets."""
     return read_codex_config_defaults()["model_provider"]
@@ -278,7 +316,7 @@ def inspect_git_repo(cwd: Path) -> dict[str, Any]:
     }
 
 
-def check_status(cwd: str | None = None) -> dict[str, Any]:
+def check_status(cwd: str | None = None, data_dir: str | Path | None = None) -> dict[str, Any]:
     """Run preflight checks for Codex binary, version, auth readiness, and optional Git repo."""
     validated_cwd = validate_cwd(cwd) if cwd is not None else None
     codex_bin = resolve_codex_bin()
@@ -302,6 +340,9 @@ def check_status(cwd: str | None = None) -> dict[str, Any]:
 
     auth = check_auth_state(codex_bin)
     defaults = read_codex_config_defaults()
+    plugin_settings = read_plugin_settings(data_dir)
+    plugin_default_model = plugin_settings["default_model"]
+    effective_default_model = plugin_default_model or defaults["model"]
     git_info = inspect_git_repo(validated_cwd) if validated_cwd is not None else None
 
     return {
@@ -313,7 +354,10 @@ def check_status(cwd: str | None = None) -> dict[str, Any]:
         "api_key_env_set": auth["api_key_env_set"],
         "custom_provider_configured": auth["custom_provider_configured"],
         "model_provider": auth["model_provider"],
-        "default_model": defaults["model"],
+        "default_model": effective_default_model,
+        "codex_default_model": defaults["model"],
+        "plugin_default_model": plugin_default_model,
+        "default_model_source": plugin_settings["source"],
         "default_reasoning_effort": defaults["model_reasoning_effort"],
         "auth_ready": auth["auth_ready"],
         "remediation": auth["remediation"],
@@ -976,7 +1020,9 @@ class CodexTaskManager:
         )
         git_info = inspect_git_repo(cwd_path)
         defaults = read_codex_config_defaults()
-        effective_model = clean_model or defaults["model"]
+        plugin_default_model = read_plugin_settings(self.data_dir)["default_model"]
+        cli_model = clean_model or plugin_default_model
+        effective_model = cli_model or defaults["model"]
         effective_effort = clean_effort or defaults["model_reasoning_effort"]
 
         def build_cmd(last_msg_path: Path) -> list[str]:
@@ -994,7 +1040,7 @@ class CodexTaskManager:
             return _append_common_exec_tail(
                 cmd,
                 is_git_repo=git_info["is_git_repo"],
-                model=clean_model,
+                model=cli_model,
                 reasoning_effort=clean_effort,
                 images=clean_images,
                 prompt=budgeted_prompt,
@@ -1052,7 +1098,9 @@ class CodexTaskManager:
             max_idle_seconds=effective_idle,
         )
         defaults = read_codex_config_defaults()
-        effective_model = clean_model or defaults["model"]
+        plugin_default_model = read_plugin_settings(self.data_dir)["default_model"]
+        cli_model = clean_model or plugin_default_model
+        effective_model = cli_model or defaults["model"]
         effective_effort = clean_effort or defaults["model_reasoning_effort"]
 
         clean_session_id: str | None = None
@@ -1098,7 +1146,7 @@ class CodexTaskManager:
             return _append_common_exec_tail(
                 cmd,
                 is_git_repo=git_info["is_git_repo"],
-                model=clean_model,
+                model=cli_model,
                 reasoning_effort=clean_effort,
                 images=clean_images,
                 prompt=budgeted_prompt,
@@ -1186,6 +1234,11 @@ class CodexTaskManager:
         git_info = inspect_git_repo(cwd_path)
         routed_via_exec = effective_mode in ("uncommitted", "base", "commit") and clean_prompt is not None
         soft_injected = routed_via_exec or effective_mode == "custom"
+        defaults = read_codex_config_defaults()
+        plugin_default_model = read_plugin_settings(self.data_dir)["default_model"]
+        cli_model = clean_model or plugin_default_model
+        effective_model = cli_model or defaults["model"]
+        effective_effort = clean_effort or defaults["model_reasoning_effort"]
 
         def build_cmd(last_msg_path: Path) -> list[str]:
             if routed_via_exec:
@@ -1216,8 +1269,8 @@ class CodexTaskManager:
                 ]
                 if not git_info["is_git_repo"]:
                     cmd.append("--skip-git-repo-check")
-                if clean_model:
-                    cmd.extend(["-m", clean_model])
+                if cli_model:
+                    cmd.extend(["-m", cli_model])
                 if clean_effort:
                     cmd.extend(["-c", f"model_reasoning_effort={json.dumps(clean_effort)}"])
                 if budgeted_review_prompt.startswith("-"):
@@ -1237,8 +1290,8 @@ class CodexTaskManager:
             ]
             if not git_info["is_git_repo"]:
                 cmd.append("--skip-git-repo-check")
-            if clean_model:
-                cmd.extend(["-m", clean_model])
+            if cli_model:
+                cmd.extend(["-m", cli_model])
             if clean_effort:
                 cmd.extend(["-c", f"model_reasoning_effort={json.dumps(clean_effort)}"])
             if clean_title:
@@ -1265,9 +1318,6 @@ class CodexTaskManager:
                 cmd.append(budgeted_custom_prompt)
             return cmd
 
-        defaults = read_codex_config_defaults()
-        effective_model = clean_model or defaults["model"]
-        effective_effort = clean_effort or defaults["model_reasoning_effort"]
         preview_source = clean_prompt or clean_title or f"review ({effective_mode})"
 
         return self._launch_and_wait(

@@ -436,7 +436,7 @@ class McpServer:
 
     def _call_status(self, args: dict[str, Any]) -> dict[str, Any]:
         _validate_arg_keys(args, {"cwd"}, ())
-        return check_status(cwd=_opt_str(args, "cwd"))
+        return check_status(cwd=_opt_str(args, "cwd"), data_dir=self.manager.data_dir)
 
     def _call_plan(self, args: dict[str, Any]) -> dict[str, Any]:
         _validate_arg_keys(

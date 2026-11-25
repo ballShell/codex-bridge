@@ -472,7 +472,8 @@ function drawWorkshopStage(canvas, workers, opts, rawTick) {
   const { theme = 'dark', previewState = null, selectedWorkerId = null } = opts || {};
   const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
   const cssW = Math.max(260, Math.floor(canvas.clientWidth || 340));
-  const cssH = 128;
+  const cssH = 92;
+  const floorH = 22;
 
   if (canvas.width !== Math.floor(cssW * dpr) || canvas.height !== Math.floor(cssH * dpr)) {
     canvas.width = Math.floor(cssW * dpr);
@@ -495,36 +496,36 @@ function drawWorkshopStage(canvas, workers, opts, rawTick) {
   // Subtle retro blueprint grid lines
   ctx.fillStyle = isDark ? 'rgba(148, 163, 184, 0.08)' : 'rgba(15, 23, 42, 0.06)';
   for (let gx = 16; gx < cssW; gx += 16) {
-    ctx.fillRect(gx, 0, 1, cssH - 28);
+    ctx.fillRect(gx, 0, 1, cssH - floorH);
   }
-  for (let gy = 16; gy < cssH - 28; gy += 16) {
+  for (let gy = 16; gy < cssH - floorH; gy += 16) {
     ctx.fillRect(0, gy, cssW, 1);
   }
 
   // Pixel window on top-left wall
-  const winW = 28;
-  const winH = 20;
+  const winW = 22;
+  const winH = 16;
   ctx.fillStyle = isDark ? '#1e293b' : '#cbd5e1';
-  ctx.fillRect(10, 8, winW, winH);
+  ctx.fillRect(8, 6, winW, winH);
   ctx.fillStyle = isDark ? '#0b1220' : '#bae6fd';
-  ctx.fillRect(12, 10, winW - 4, winH - 4);
+  ctx.fillRect(10, 8, winW - 4, winH - 4);
   if (isDark) {
     ctx.fillStyle = '#fde68a';
-    ctx.fillRect(16, 13, 2, 2);
+    ctx.fillRect(13, 10, 2, 2);
     ctx.fillStyle = rawTick % 12 < 6 ? '#f8fafc' : '#94a3b8';
-    ctx.fillRect(28, 16, 2, 2);
-    ctx.fillRect(22, 20, 1, 1);
+    ctx.fillRect(22, 13, 2, 2);
+    ctx.fillRect(18, 16, 1, 1);
   } else {
     ctx.fillStyle = '#ffffff';
-    ctx.fillRect(16, 14, 6, 3);
-    ctx.fillRect(25, 17, 5, 2);
+    ctx.fillRect(12, 11, 5, 2);
+    ctx.fillRect(20, 14, 4, 2);
   }
 
   // Studio floor strip
   ctx.fillStyle = isDark ? '#1e293b' : '#e2e8f0';
-  ctx.fillRect(0, cssH - 28, cssW, 28);
+  ctx.fillRect(0, cssH - floorH, cssW, floorH);
   ctx.fillStyle = isDark ? '#334155' : '#cbd5e1';
-  ctx.fillRect(0, cssH - 28, cssW, 2);
+  ctx.fillRect(0, cssH - floorH, cssW, 2);
 
   // Determine cast of bots to render on stage
   let cast = [];
@@ -560,13 +561,13 @@ function drawWorkshopStage(canvas, workers, opts, rawTick) {
   }
 
   const slotCount = cast.length;
-  const scale = slotCount >= 5 ? 2 : 3;
+  const scale = 2;
   const spritePx = 24 * scale;
   const maxSlotW = Math.floor((cssW - 24) / Math.max(1, slotCount));
-  const spacing = Math.min(108, Math.max(spritePx + 10, maxSlotW));
+  const spacing = Math.min(92, Math.max(spritePx + 10, maxSlotW));
   const totalSpan = spacing * (slotCount - 1) + spritePx;
   const startX = Math.max(12, Math.floor((cssW - totalSpan) / 2));
-  const spriteTopY = cssH - 28 - spritePx + 2;
+  const spriteTopY = cssH - floorH - spritePx + 2;
 
   const hitboxes = [];
   cast.forEach((worker, idx) => {
@@ -577,10 +578,10 @@ function drawWorkshopStage(canvas, workers, opts, rawTick) {
 
     if (isSelected) {
       ctx.fillStyle = isDark ? 'rgba(56, 189, 248, 0.14)' : 'rgba(14, 165, 233, 0.14)';
-      ctx.fillRect(drawX - 4, spriteTopY - 6, spritePx + 8, spritePx + 26);
+      ctx.fillRect(drawX - 4, spriteTopY - 4, spritePx + 8, spritePx + 20);
       ctx.strokeStyle = palette.accent;
       ctx.lineWidth = 1.5;
-      ctx.strokeRect(drawX - 4, spriteTopY - 6, spritePx + 8, spritePx + 26);
+      ctx.strokeRect(drawX - 4, spriteTopY - 4, spritePx + 8, spritePx + 20);
     }
 
     ctx.save();
@@ -597,14 +598,14 @@ function drawWorkshopStage(canvas, workers, opts, rawTick) {
     const textW = Math.ceil(ctx.measureText(labelText).width);
     const pillW = textW + 8;
     const pillX = Math.max(2, Math.min(cssW - pillW - 2, Math.round(centerX - pillW / 2)));
-    const pillY = cssH - 20;
+    const pillY = cssH - 17;
 
     ctx.fillStyle = badge.bg;
-    ctx.fillRect(pillX, pillY, pillW, 14);
+    ctx.fillRect(pillX, pillY, pillW, 13);
     ctx.fillStyle = badge.fg;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(labelText, pillX + pillW / 2, pillY + 7);
+    ctx.fillText(labelText, pillX + pillW / 2, pillY + 6.5);
 
     if (worker.worker_id && !worker.worker_id.startsWith('__')) {
       hitboxes.push({
@@ -612,7 +613,7 @@ function drawWorkshopStage(canvas, workers, opts, rawTick) {
         x: drawX - 4,
         y: spriteTopY - 4,
         w: spritePx + 8,
-        h: spritePx + 24,
+        h: spritePx + 20,
       });
     }
   });
@@ -623,6 +624,8 @@ function drawWorkshopStage(canvas, workers, opts, rawTick) {
 
 globalThis.CodexSprites = {
   ANIMATION_STATES,
+  STAGE_BADGE_MAP,
+  shortModelLabel,
   getPaletteForWorker,
   resolveSpriteState,
   getEffortCadence,

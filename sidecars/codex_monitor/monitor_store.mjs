@@ -19,9 +19,11 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 
 export const SAFE_ID_RE = /^[A-Za-z0-9_-]{8,}$/;
+export const SAFE_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$/;
+const SETTINGS_FILENAME = 'settings.json';
 const UUID_CAPTURE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const CONV_JSON_RE = new RegExp(`(?:\\\\)?"conversationId(?:\\\\)?"\\s*:\\s*(?:\\\\)?"(${UUID_CAPTURE})(?:\\\\)?"`, 'gi');
 const BRAIN_URI_RE = new RegExp(`brain/(${UUID_CAPTURE})/\\.system_generated/logs/`, 'gi');
@@ -99,6 +101,7 @@ export function readCodexDefaults(codexHomeDir) {
     model: null,
     model_reasoning_effort: null,
     model_provider: null,
+    model_catalog_json: null,
   };
   const cfgPath = join(codexHomeDir, 'config.toml');
   if (!existsSync(cfgPath)) return defaults;
@@ -126,6 +129,142 @@ export function readCodexDefaults(codexHomeDir) {
     }
   }
   return defaults;
+}
+
+export function sanitizeModelId(raw) {
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw.trim();
+  if (!cleaned || !SAFE_MODEL_RE.test(cleaned)) return null;
+  return cleaned;
+}
+
+export function parseSettingsDefaultModel(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'string') {
+    const err = new Error('default_model must be a string or null.');
+    err.statusCode = 400;
+    throw err;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const cleaned = sanitizeModelId(trimmed);
+  if (!cleaned) {
+    const err = new Error('Invalid default_model identifier.');
+    err.statusCode = 400;
+    throw err;
+  }
+  return cleaned;
+}
+
+export function readPluginSettings(pluginDataDir, env = process.env) {
+  const settingsPath = join(pluginDataDir, SETTINGS_FILENAME);
+  if (existsSync(settingsPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(settingsPath, 'utf8'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const configured = sanitizeModelId(parsed.default_model);
+        if (configured) {
+          return {
+            default_model: configured,
+            source: 'plugin',
+          };
+        }
+      }
+    } catch {
+      // ignore malformed settings file
+    }
+  }
+
+  const envModel = sanitizeModelId(env?.CODEX_BRIDGE_DEFAULT_MODEL || '');
+  if (envModel) {
+    return {
+      default_model: envModel,
+      source: 'env',
+    };
+  }
+  return {
+    default_model: null,
+    source: 'codex',
+  };
+}
+
+export function writePluginSettings(pluginDataDir, { default_model = null } = {}) {
+  let cleanModel = null;
+  if (default_model !== null && default_model !== undefined && default_model !== '') {
+    cleanModel = sanitizeModelId(default_model);
+    if (!cleanModel) {
+      throw new Error('Invalid default_model identifier.');
+    }
+  }
+
+  mkdirSync(pluginDataDir, { recursive: true });
+  const settingsPath = join(pluginDataDir, SETTINGS_FILENAME);
+  const tmpPath = join(pluginDataDir, `.${SETTINGS_FILENAME}.${randomUUID().slice(0, 8)}.tmp`);
+  const payload = {
+    default_model: cleanModel,
+    updated_at: Date.now() / 1000,
+  };
+  writeFileSync(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  renameSync(tmpPath, settingsPath);
+  return {
+    default_model: cleanModel,
+    source: cleanModel ? 'plugin' : 'codex',
+  };
+}
+
+function resolveCatalogPath(codexHomeDir, rawCatalogPath) {
+  if (!rawCatalogPath || typeof rawCatalogPath !== 'string') return null;
+  const trimmed = rawCatalogPath.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('~/') || trimmed.startsWith('~\\')) {
+    return join(homedir(), trimmed.slice(2));
+  }
+  return isAbsolute(trimmed) ? trimmed : join(codexHomeDir, trimmed);
+}
+
+export function readAvailableCodexModels(codexHomeDir, defaults = null, pluginDefaultModel = null) {
+  const cfg = defaults || readCodexDefaults(codexHomeDir);
+  const candidates = [];
+  const configuredCatalog = resolveCatalogPath(codexHomeDir, cfg?.model_catalog_json);
+  if (configuredCatalog) candidates.push(configuredCatalog);
+  candidates.push(join(codexHomeDir, 'models_cache.json'));
+
+  const seen = new Set();
+  const models = [];
+
+  const pushModel = (id, label) => {
+    const cleanId = sanitizeModelId(id);
+    if (!cleanId || seen.has(cleanId)) return;
+    seen.add(cleanId);
+    const cleanLabel = typeof label === 'string' && label.trim() ? label.trim() : cleanId;
+    models.push({ id: cleanId, label: cleanLabel });
+  };
+
+  for (const catalogPath of candidates) {
+    if (!catalogPath || !existsSync(catalogPath)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(catalogPath, 'utf8'));
+      const entries = Array.isArray(parsed?.models)
+        ? parsed.models
+        : Array.isArray(parsed)
+          ? parsed
+          : [];
+      for (const entry of entries) {
+        if (!entry || typeof entry !== 'object') continue;
+        if (entry.visibility === 'hide') continue;
+        const slug = entry.slug || entry.id || entry.name;
+        const displayName = entry.display_name || slug;
+        pushModel(slug, displayName);
+      }
+      if (models.length > 0) break;
+    } catch {
+      // ignore invalid catalog JSON and try fallback
+    }
+  }
+
+  pushModel(cfg?.model, cfg?.model);
+  pushModel(pluginDefaultModel, pluginDefaultModel);
+  return models;
 }
 
 function isExecutable(filePath) {
@@ -553,6 +692,30 @@ export function createMonitorStore(env = process.env) {
           ? record.events_count
           : 0;
 
+    const maxDurationSeconds =
+      typeof record.max_duration_seconds === 'number' && Number.isFinite(record.max_duration_seconds)
+        ? Math.round(record.max_duration_seconds)
+        : null;
+    const softBudgetSeconds =
+      typeof record.soft_budget_seconds === 'number' && Number.isFinite(record.soft_budget_seconds)
+        ? Math.round(record.soft_budget_seconds)
+        : null;
+    const maxIdleSeconds =
+      typeof record.max_idle_seconds === 'number' && Number.isFinite(record.max_idle_seconds)
+        ? Math.round(record.max_idle_seconds)
+        : null;
+    let idleMs =
+      typeof record.idle_ms === 'number' && Number.isFinite(record.idle_ms) && record.idle_ms >= 0
+        ? Math.round(record.idle_ms)
+        : 0;
+    if (status === 'running' && typeof record.last_event_at === 'number' && record.last_event_at > 0) {
+      idleMs = Math.max(0, Math.round(Date.now() - record.last_event_at * 1000));
+    }
+    const remainingMs =
+      status === 'running' && maxDurationSeconds !== null
+        ? Math.max(0, maxDurationSeconds * 1000 - elapsedMs)
+        : null;
+
     return {
       worker_id: String(record.task_id || fallbackTaskId),
       source: 'bridge',
@@ -566,6 +729,13 @@ export function createMonitorStore(env = process.env) {
       reasoning_effort: record.reasoning_effort || null,
       status,
       activity,
+      timed_out: Boolean(record.timed_out || activity === 'timed_out'),
+      timeout_reason: typeof record.timeout_reason === 'string' ? record.timeout_reason : null,
+      max_duration_seconds: maxDurationSeconds,
+      soft_budget_seconds: softBudgetSeconds,
+      max_idle_seconds: maxIdleSeconds,
+      idle_ms: idleMs,
+      remaining_ms: remainingMs,
       usage: normalizeUsage(record.usage),
       changed_files: changedFiles,
       changed_files_count: changedFiles.length,
@@ -686,6 +856,30 @@ export function createMonitorStore(env = process.env) {
     const cleanScope = scope === 'all' ? 'all' : 'conversation';
     const paths = resolvePaths(env);
     const cliStatus = await getCachedCliStatus();
+    const freshDefaults = readCodexDefaults(paths.codexHomeDir);
+    const pluginSettings = readPluginSettings(paths.pluginDataDir, env);
+    const codexDefaultModel = freshDefaults.model || cliStatus.default_model || null;
+    const effectiveDefaultModel = pluginSettings.default_model || codexDefaultModel || null;
+    const availableModels = readAvailableCodexModels(
+      paths.codexHomeDir,
+      freshDefaults,
+      pluginSettings.default_model
+    );
+    const mergedCliStatus = {
+      ...cliStatus,
+      model_provider: freshDefaults.model_provider ?? cliStatus.model_provider,
+      default_model: effectiveDefaultModel,
+      codex_default_model: codexDefaultModel,
+      plugin_default_model: pluginSettings.default_model,
+      default_reasoning_effort: freshDefaults.model_reasoning_effort ?? cliStatus.default_reasoning_effort,
+    };
+    const settings = {
+      default_model: pluginSettings.default_model,
+      effective_model: effectiveDefaultModel,
+      codex_default_model: codexDefaultModel,
+      source: pluginSettings.source,
+      available_models: availableModels,
+    };
     const scopeInfo = resolveConversationScope(paths.brainDir, conversationId);
 
     const workers = [];
@@ -727,10 +921,16 @@ export function createMonitorStore(env = process.env) {
       conversation_id: scopeInfo.hasConversation ? conversationId : null,
       has_conversation: scopeInfo.hasConversation,
       subagent_count: scopeInfo.childCount,
-      cli_status: cliStatus,
+      cli_status: mergedCliStatus,
+      settings,
       stats,
       workers: workers.slice(0, clampedLimit),
     };
+  }
+
+  function updateSettings({ default_model = null } = {}) {
+    const paths = resolvePaths(env);
+    return writePluginSettings(paths.pluginDataDir, { default_model });
   }
 
   function clearFinishedTasks({ conversationId = '', scope = 'conversation' } = {}) {
@@ -769,6 +969,7 @@ export function createMonitorStore(env = process.env) {
   return {
     getSnapshot,
     clearFinishedTasks,
+    updateSettings,
     resolveConversationScope: (convId) => resolveConversationScope(resolvePaths(env).brainDir, convId),
     resolvePaths: () => resolvePaths(env),
   };
@@ -782,14 +983,37 @@ function escapeScriptClose(jsText) {
   return String(jsText).replace(/<\/script/gi, '<\\/script');
 }
 
+const DRAGON_GIF_STATES = ['idle', 'thinking', 'coding', 'reviewing', 'completed', 'failed'];
+
+export function loadDragonGifDataUris(sidecarDir) {
+  const dragonDir = join(sidecarDir, 'assets', 'dragon');
+  const map = {};
+  for (const state of DRAGON_GIF_STATES) {
+    const filePath = join(dragonDir, `${state}.gif`);
+    if (!existsSync(filePath)) continue;
+    try {
+      const b64 = readFileSync(filePath).toString('base64');
+      if (b64) map[state] = `data:image/gif;base64,${b64}`;
+    } catch {
+      // skip unreadable asset
+    }
+  }
+  return map;
+}
+
 export function buildMonitorHtml(sidecarDir) {
   const html = readFileSync(join(sidecarDir, 'index.html'), 'utf8');
   const css = readFileSync(join(sidecarDir, 'styles.css'), 'utf8');
   const spritesJs = readFileSync(join(sidecarDir, 'sprites.js'), 'utf8');
   const appJs = readFileSync(join(sidecarDir, 'app.js'), 'utf8');
+  const dragonGifs = loadDragonGifDataUris(sidecarDir);
 
   const styleBlock = `<style>\n${escapeStyleClose(css)}\n  </style>`;
-  const scriptBlock = `<script>\n${escapeScriptClose(spritesJs)}\n  </script>\n  <script>\n${escapeScriptClose(appJs)}\n  </script>`;
+  const dragonBlock =
+    Object.keys(dragonGifs).length > 0
+      ? `<script>\nglobalThis.__CODEX_DRAGON_GIFS__ = ${escapeScriptClose(JSON.stringify(dragonGifs))};\n  </script>\n  `
+      : '';
+  const scriptBlock = `${dragonBlock}<script>\n${escapeScriptClose(spritesJs)}\n  </script>\n  <script>\n${escapeScriptClose(appJs)}\n  </script>`;
 
   return html
     .replace(/<!--INLINE_STYLES_START-->[\s\S]*?<!--INLINE_STYLES_END-->/, () => styleBlock)

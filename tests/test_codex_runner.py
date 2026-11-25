@@ -1297,6 +1297,74 @@ class TestCodexTaskManager(unittest.TestCase):
         self.assertEqual(res["timeout_reason"], "max_duration")
         self.assertEqual(res["returncode"], 0)
 
+    def test_plugin_isolated_default_model_overrides_codex_config_without_mutating_it(self) -> None:
+        repo = self._init_git_repo("isolated_model_repo")
+        codex_home = self.tmpdir / "isolated_codex_home"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            'model_provider = "custom"\nmodel = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n',
+            encoding="utf-8",
+        )
+        (self.manager.data_dir / "settings.json").write_text(
+            json.dumps({"default_model": "gpt-6.2-sol"}),
+            encoding="utf-8",
+        )
+        args_file = self.tmpdir / "captured_args.jsonl"
+
+        def _last_argv() -> list[str]:
+            lines = [ln for ln in args_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            return json.loads(lines[-1])["argv"]
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_HOME": str(codex_home),
+                "FAKE_CODEX_ARGS_FILE": str(args_file),
+            },
+            clear=False,
+        ):
+            status = check_status(cwd=str(repo), data_dir=self.manager.data_dir)
+            self.assertEqual(status["default_model"], "gpt-6.2-sol")
+            self.assertEqual(status["codex_default_model"], "gpt-6-astra")
+            self.assertEqual(status["plugin_default_model"], "gpt-6.2-sol")
+            self.assertEqual(status["default_model_source"], "plugin")
+
+            plan_res = self.manager.run_plan(prompt="Check isolated model", cwd=str(repo))
+            self.assertEqual(plan_res["status"], "completed")
+            self.assertEqual(plan_res["model"], "gpt-6.2-sol")
+            captured = _last_argv()
+            self.assertIn("-m", captured)
+            self.assertEqual(captured[captured.index("-m") + 1], "gpt-6.2-sol")
+
+            # Explicit per-call model still overrides plugin default
+            exec_res = self.manager.run_exec(
+                prompt="Explicit model wins",
+                cwd=str(repo),
+                model="gpt-6.1-sol",
+            )
+            self.assertEqual(exec_res["status"], "completed")
+            self.assertEqual(exec_res["model"], "gpt-6.1-sol")
+            captured_exec = _last_argv()
+            self.assertEqual(captured_exec[captured_exec.index("-m") + 1], "gpt-6.1-sol")
+
+            # Review also inherits plugin default
+            rev_res = self.manager.run_review(cwd=str(repo), mode="uncommitted")
+            self.assertEqual(rev_res["status"], "completed")
+            self.assertEqual(rev_res["model"], "gpt-6.2-sol")
+            captured_rev = _last_argv()
+            self.assertEqual(captured_rev[captured_rev.index("-m") + 1], "gpt-6.2-sol")
+
+            # Clearing plugin default falls back to ~/.codex/config.toml without -m
+            (self.manager.data_dir / "settings.json").write_text(
+                json.dumps({"default_model": None}),
+                encoding="utf-8",
+            )
+            fallback_res = self.manager.run_plan(prompt="Fallback to Codex default", cwd=str(repo))
+            self.assertEqual(fallback_res["status"], "completed")
+            self.assertEqual(fallback_res["model"], "gpt-6-astra")
+            captured_fb = _last_argv()
+            self.assertNotIn("-m", captured_fb)
+
 
 if __name__ == "__main__":
     unittest.main()

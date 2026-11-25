@@ -9,6 +9,7 @@ import vm from 'node:vm';
 import {
   buildMonitorHtml,
   createMonitorStore,
+  parseSettingsDefaultModel,
   resolvePaths,
 } from '../sidecars/codex_monitor/monitor_store.mjs';
 
@@ -68,12 +69,24 @@ function loadClassicSprites(sandboxOverrides = {}) {
 function makeFakeCodexEnv(rootDir) {
   const codexHome = join(rootDir, 'codex_home');
   mkdirSync(join(codexHome, 'sessions'), { recursive: true });
+  const catalogPath = join(codexHome, 'custom-catalog.json');
   writeFileSync(
-    join(codexHome, 'config.toml'),
-    'model = "gpt-6.2-sol"\nmodel_reasoning_effort = "high"\nmodel_provider = "custom"\n',
+    catalogPath,
+    JSON.stringify({
+      models: [
+        { slug: 'gpt-6-astra', display_name: 'gpt-6-astra', visibility: 'list' },
+        { slug: 'gpt-6.2-sol', display_name: 'gpt-6.2-sol', visibility: 'list' },
+        { slug: 'hidden-internal', display_name: 'hidden', visibility: 'hide' },
+      ],
+    }),
     'utf8'
   );
-  return { codexHome };
+  writeFileSync(
+    join(codexHome, 'config.toml'),
+    `model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\nmodel_provider = "custom"\nmodel_catalog_json = "${catalogPath}"\n`,
+    'utf8'
+  );
+  return { codexHome, catalogPath };
 }
 
 test('resolvePaths derives brainDir and pluginDataDir from ANTIGRAVITY_EXECUTABLE_DATA_DIR', () => {
@@ -251,6 +264,27 @@ test('per-conversation isolation, subagent tree inheritance, historical backfill
       afterB.workers.map((w) => w.task_id),
       ['task_cccc11112222']
     );
+
+    // Model catalog discovery & lightweight plugin-isolated default model settings
+    assert.deepEqual(
+      afterB.settings.available_models.map((m) => m.id),
+      ['gpt-6-astra', 'gpt-6.2-sol']
+    );
+    assert.equal(afterB.settings.default_model, null);
+    assert.equal(afterB.settings.codex_default_model, 'gpt-6-astra');
+    assert.equal(afterB.settings.effective_model, 'gpt-6-astra');
+
+    store.updateSettings({ default_model: 'gpt-6.2-sol' });
+    const isolatedSnap = await store.getSnapshot({ conversationId: convB, scope: 'conversation' });
+    assert.equal(isolatedSnap.settings.default_model, 'gpt-6.2-sol');
+    assert.equal(isolatedSnap.settings.codex_default_model, 'gpt-6-astra');
+    assert.equal(isolatedSnap.settings.effective_model, 'gpt-6.2-sol');
+    assert.equal(isolatedSnap.settings.source, 'plugin');
+
+    store.updateSettings({ default_model: null });
+    const resetSnap = await store.getSnapshot({ conversationId: convB, scope: 'conversation' });
+    assert.equal(resetSnap.settings.default_model, null);
+    assert.equal(resetSnap.settings.effective_model, 'gpt-6-astra');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -284,10 +318,14 @@ test('classic sprites.js renders all 6 pixel states, standby stage, and multi-wo
   assert.equal(hitboxes.length, 2);
 });
 
-test('buildMonitorHtml inlines classic CSS/JS without module scripts and preserves fallback shell', () => {
+test('buildMonitorHtml inlines classic CSS/JS, dragon GIF data URIs, and preserves fallback shell', () => {
   const html = buildMonitorHtml(SIDECAR_DIR);
   assert.match(html, /src="\/preload\.js"/);
   assert.match(html, /<style>[\s\S]*\.app-shell[\s\S]*<\/style>/);
+  assert.match(html, /globalThis\.__CODEX_DRAGON_GIFS__\s*=/);
+  assert.match(html, /"idle":"data:image\/gif;base64,/);
+  assert.match(html, /"reviewing":"data:image\/gif;base64,/);
+  assert.match(html, /"failed":"data:image\/gif;base64,/);
   assert.match(html, /<script>[\s\S]*globalThis\.CodexSprites[\s\S]*<\/script>/);
   assert.doesNotMatch(html, /type\s*=\s*["']module["']/i);
   assert.doesNotMatch(html, /<!--INLINE_STYLES_START-->/);
@@ -295,7 +333,7 @@ test('buildMonitorHtml inlines classic CSS/JS without module scripts and preserv
   assert.match(html, /<div id="app">[\s\S]*Codex Monitor[\s\S]*<\/div>/);
 });
 
-async function runAppInMockVm({ fetchImpl }) {
+async function runAppInMockVm({ fetchImpl, dragonGifs = null }) {
   const appCode = readFileSync(join(SIDECAR_DIR, 'app.js'), 'utf8');
   const spritesCode = readFileSync(join(SIDECAR_DIR, 'sprites.js'), 'utf8');
   const appRoot = { innerHTML: '' };
@@ -308,7 +346,34 @@ async function runAppInMockVm({ fetchImpl }) {
     },
     appendChild() {},
   };
+  const docListeners = {};
   const winListeners = {};
+  const focusCalls = [];
+  let nextPollCallback = null;
+  let lastOptionNodes = [];
+
+  function parseModelOptionNodes() {
+    const nodes = [];
+    const re = /data-select-model="([^"]*)"/g;
+    let m;
+    while ((m = re.exec(appRoot.innerHTML)) !== null) {
+      const val = m[1];
+      const node = {
+        id: '',
+        selector: `[data-select-model="${val}"]`,
+        hasAttribute: (attr) => attr === 'data-select-model',
+        getAttribute: (attr) => (attr === 'data-select-model' ? val : null),
+        focus(opts) {
+          ctx.document.activeElement = node;
+          focusCalls.push({ selector: node.selector, opts });
+        },
+      };
+      nodes.push(node);
+    }
+    lastOptionNodes = nodes;
+    return nodes;
+  }
+
   const ctx = {
     console,
     Math,
@@ -322,18 +387,36 @@ async function runAppInMockVm({ fetchImpl }) {
     location: { search: '?conversationId=11111111-1111-1111-1111-111111111111' },
     CSS: { escape: (s) => String(s) },
     getComputedStyle: () => ({ color: 'rgb(255, 255, 255)' }),
-    setTimeout: () => 0,
-    clearTimeout: () => {},
+    setTimeout: (fn) => {
+      nextPollCallback = fn;
+      return 1;
+    },
+    clearTimeout: () => {
+      nextPollCallback = null;
+    },
     setInterval: () => 0,
     clearInterval: () => {},
     document: {
       hidden: false,
+      activeElement: null,
       documentElement: rootEl,
       body: rootEl,
       createElement: () => ({ style: {}, remove() {} }),
       getElementById: (id) => (id === 'app' ? appRoot : id === 'workshop-canvas' ? workshopCanvas : null),
-      querySelectorAll: () => [],
-      addEventListener() {},
+      querySelector: (selector) => {
+        const opt = lastOptionNodes.find((n) => n.selector === selector);
+        if (opt) return opt;
+        return {
+          selector,
+          focus(opts) {
+            focusCalls.push({ selector, opts });
+          },
+        };
+      },
+      querySelectorAll: (selector) => (selector === '[data-select-model]' ? parseModelOptionNodes() : []),
+      addEventListener(name, fn) {
+        docListeners[name] = fn;
+      },
     },
     window: {
       devicePixelRatio: 1,
@@ -348,6 +431,9 @@ async function runAppInMockVm({ fetchImpl }) {
   };
   ctx.globalThis = ctx;
   ctx.self = ctx;
+  if (dragonGifs) {
+    ctx.__CODEX_DRAGON_GIFS__ = dragonGifs;
+  }
 
   vm.runInNewContext(spritesCode, ctx, { filename: 'sprites.js' });
   vm.runInNewContext(appCode, ctx, { filename: 'app.js' });
@@ -356,9 +442,49 @@ async function runAppInMockVm({ fetchImpl }) {
   await new Promise((r) => setImmediate(r));
   return {
     initialHtml,
-    finalHtml: appRoot.innerHTML,
+    get finalHtml() {
+      return appRoot.innerHTML;
+    },
     mounted: Boolean(ctx.window.__codexMonitorMounted),
     workshopFillOps: workshopCanvas.getFillOps(),
+    focusCalls,
+    dispatchClick(target) {
+      if (typeof docListeners.click === 'function') {
+        docListeners.click({ target });
+      }
+    },
+    dispatchChange(target) {
+      if (typeof docListeners.change === 'function') {
+        docListeners.change({ target });
+      }
+    },
+    dispatchKeydown(key) {
+      let prevented = false;
+      if (typeof docListeners.keydown === 'function') {
+        docListeners.keydown({
+          key,
+          preventDefault() {
+            prevented = true;
+          },
+        });
+      }
+      return prevented;
+    },
+    setActiveElement(el) {
+      ctx.document.activeElement = el;
+    },
+    get activeElement() {
+      return ctx.document.activeElement;
+    },
+    async triggerNextPoll() {
+      if (typeof nextPollCallback === 'function') {
+        const fn = nextPollCallback;
+        nextPollCallback = null;
+        fn();
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+      }
+    },
   };
 }
 
@@ -375,6 +501,16 @@ test('app.js renders default dashboard for zero-task conversations and degrades 
           has_conversation: true,
           subagent_count: 0,
           cli_status: { binary_found: true, auth_ready: true, default_model: 'gpt-6.2-sol' },
+          settings: {
+            default_model: null,
+            effective_model: 'gpt-6.2-sol',
+            codex_default_model: 'gpt-6.2-sol',
+            source: 'codex',
+            available_models: [
+              { id: 'gpt-6-astra', label: 'gpt-6-astra' },
+              { id: 'gpt-6.2-sol', label: 'gpt-6.2-sol' },
+            ],
+          },
           stats: {
             total_workers: 0,
             running_count: 0,
@@ -406,7 +542,9 @@ test('app.js renders default dashboard for zero-task conversations and degrades 
   assert.ok(zeroTaskRun.workshopFillOps > 0);
   assert.match(zeroTaskRun.initialHtml, /id="workshop-canvas"/);
   assert.match(zeroTaskRun.initialHtml, /0 \/ 0/);
-  assert.match(zeroTaskRun.finalHtml, /CLI 就绪 · gpt-6\.2-sol/);
+  assert.match(zeroTaskRun.finalHtml, /CLI 就绪/);
+  assert.match(zeroTaskRun.finalHtml, /id="btn-model-picker"/);
+  assert.match(zeroTaskRun.finalHtml, /跟随 · gpt-6\.2-sol/);
   assert.match(zeroTaskRun.finalHtml, /class="empty-title"/);
   assert.match(zeroTaskRun.finalHtml, /class="empty-card"/);
   assert.doesNotMatch(zeroTaskRun.finalHtml, /class="empty-desc"/);
@@ -423,4 +561,368 @@ test('app.js renders default dashboard for zero-task conversations and degrades 
   assert.match(errorRun.finalHtml, /backend unreachable/);
   assert.match(errorRun.finalHtml, /id="workshop-canvas"/);
   assert.match(errorRun.finalHtml, /0 \/ 0/);
+});
+
+test('app.js omits pose preview strip, renders unified KPI chips, model picker, and error callout cleanly', async () => {
+  const settingsPosts = [];
+  const basePayload = {
+    generated_at: Date.now() / 1000,
+    scope: 'conversation',
+    conversation_id: '11111111-1111-1111-1111-111111111111',
+    has_conversation: true,
+    subagent_count: 2,
+    cli_status: { binary_found: true, auth_ready: true, default_model: 'gpt-6.2-sol', codex_default_model: 'gpt-6-astra' },
+    settings: {
+      default_model: 'gpt-6.2-sol',
+      effective_model: 'gpt-6.2-sol',
+      codex_default_model: 'gpt-6-astra',
+      source: 'plugin',
+      available_models: [
+        { id: 'gpt-6-astra', label: 'gpt-6-astra' },
+        { id: 'gpt-6.2-sol', label: 'gpt-6.2-sol' },
+      ],
+    },
+    stats: {
+      total_workers: 2,
+      running_count: 1,
+      completed_count: 0,
+      failed_count: 1,
+      tokens: {
+        input_tokens: 120000,
+        cached_input_tokens: 30000,
+        output_tokens: 4000,
+        reasoning_output_tokens: 99,
+        total_tokens: 124000,
+        cache_hit_rate: 0.25,
+      },
+      total_elapsed_ms: 185000,
+      avg_elapsed_ms: 92500,
+      total_changed_files: 3,
+      success_rate: 0,
+      by_model: [{ model: 'gpt-6.2-sol', count: 2, running: 1, total_tokens: 124000 }],
+      by_effort: [{ effort: 'high', count: 2 }],
+      by_mode: [{ mode: 'review', count: 2 }],
+    },
+    workers: [
+      {
+        worker_id: 'task_run_1',
+        model: 'gpt-6.2-sol',
+        reasoning_effort: 'high',
+        mode: 'review',
+        status: 'running',
+        activity: 'reviewing',
+        elapsed_ms: 45000,
+        max_duration_seconds: 180,
+        idle_ms: 35000,
+        prompt_preview: 'Review auth middleware changes',
+        usage: { input_tokens: 60000, cached_input_tokens: 10000, output_tokens: 1000, total_tokens: 61000 },
+      },
+      {
+        worker_id: 'task_to_2',
+        model: 'gpt-6.2-sol',
+        reasoning_effort: 'high',
+        mode: 'review',
+        status: 'failed',
+        activity: 'timed_out',
+        timed_out: true,
+        timeout_reason: 'max_duration',
+        max_duration_seconds: 140,
+        elapsed_ms: 140000,
+        prompt_preview: 'Review full repo diff',
+        error: 'Codex task exceeded hard duration limit (140s).',
+        usage: { input_tokens: 60000, cached_input_tokens: 20000, output_tokens: 3000, total_tokens: 63000 },
+      },
+      {
+        worker_id: 'task_http404_3',
+        model: 'gpt-6.2-sol',
+        reasoning_effort: 'medium',
+        mode: 'review',
+        status: 'failed',
+        activity: 'failed',
+        max_duration_seconds: 300,
+        soft_budget_seconds: 240,
+        max_idle_seconds: 150,
+        elapsed_ms: 56000,
+        session_id: '01a2114a-2ef7-7610-b0fd-ea23345f47b8',
+        conversation_id: '6d1eed8d-5c50-4530-9048-cb2ced0b3898',
+        cwd: '/Users/ballshell/Documents/Codex/AgentsWorkSpace/Antigravity-codex-bridge',
+        prompt_preview: 'Review monitor refactor',
+        error:
+          'Reconnecting... 1/5 (unexpected status 404 Not Found: <html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>, url: https://ai.mindflow.com.cn/v1/responses)\n' +
+          'Reconnecting... 5/5 (unexpected status 404 Not Found: <html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>, url: https://ai.mindflow.com.cn/v1/responses)',
+        usage: { input_tokens: 236000, cached_input_tokens: 165900, output_tokens: 506, reasoning_output_tokens: 29, total_tokens: 236506 },
+      },
+    ],
+  };
+
+  const populatedRun = await runAppInMockVm({
+    fetchImpl: async (url, options) => {
+      if (url === '/api/settings') {
+        const body = JSON.parse(options.body);
+        settingsPosts.push(body);
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              ...basePayload,
+              settings: {
+                ...basePayload.settings,
+                default_model: body.default_model,
+                effective_model: body.default_model || 'gpt-6-astra',
+                source: body.default_model ? 'plugin' : 'codex',
+              },
+            };
+          },
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return basePayload;
+        },
+      };
+    },
+  });
+
+  assert.equal(populatedRun.mounted, true);
+  assert.doesNotMatch(populatedRun.finalHtml, /class="pose-strip"|data-pose=/);
+  assert.doesNotMatch(populatedRun.finalHtml, /id="btn-refresh"/);
+  assert.doesNotMatch(populatedRun.finalHtml, /id="btn-clear"/);
+  assert.doesNotMatch(populatedRun.finalHtml, /class="breakdown-block"/);
+  assert.doesNotMatch(populatedRun.finalHtml, /当前会话 \+2 子代理/);
+  assert.match(populatedRun.finalHtml, /class="worker-sprite" width="40" height="40" data-sprite-worker="task_run_1"/);
+  assert.doesNotMatch(populatedRun.finalHtml, /class="stack-bar"/);
+  assert.match(populatedRun.finalHtml, /<button type="button" class="worker-toggle" data-toggle-worker="task_run_1" aria-expanded="false">/);
+  // Work statistics uses unified kpi-pill chips with only Cache under Total tokens (no progress bar / output / reasoning)
+  assert.doesNotMatch(populatedRun.finalHtml, /class="kpi-token-bar"/);
+  assert.match(populatedRun.finalHtml, /class="kpi-pill"[^>]*><span class="kpi-dot is-ok"[^>]*><\/span><span>缓存 25%<\/span><\/span>/);
+  assert.match(populatedRun.finalHtml, /<span>0 完成<\/span>/);
+  assert.match(populatedRun.finalHtml, /<span>1 失败<\/span>/);
+  assert.match(populatedRun.finalHtml, /<span>平均 1m 32s<\/span>/);
+  assert.match(populatedRun.finalHtml, /<span>0\/1 通过<\/span>/);
+  assert.doesNotMatch(populatedRun.finalHtml, /<span>输出 4\.00K<\/span>/);
+  assert.doesNotMatch(populatedRun.finalHtml, /<span>推理 99<\/span>/);
+  // Custom theme-native model picker opens listbox and posts /api/settings on option click
+  assert.match(populatedRun.finalHtml, /id="btn-model-picker"[\s\S]*class="model-trigger is-isolated"/);
+  assert.doesNotMatch(populatedRun.finalHtml, /class="model-menu"/);
+  populatedRun.dispatchClick({
+    id: 'btn-model-picker',
+    closest(sel) {
+      if (sel === 'button') return { id: 'btn-model-picker' };
+      if (sel === '#model-picker') return {};
+      return null;
+    },
+  });
+  assert.match(populatedRun.finalHtml, /class="model-menu" role="listbox"/);
+  assert.match(populatedRun.finalHtml, /data-select-model="gpt-6-astra"/);
+  populatedRun.dispatchClick({
+    id: '',
+    closest(sel) {
+      if (sel === '[data-select-model]') return { getAttribute: () => 'gpt-6-astra' };
+      return null;
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(settingsPosts.length, 1);
+  assert.equal(settingsPosts[0].default_model, 'gpt-6-astra');
+  assert.doesNotMatch(populatedRun.finalHtml, /class="model-menu"/);
+  assert.match(populatedRun.finalHtml, /class="meta-tag" title="gpt-6\.2-sol">gpt-6\.2-sol</);
+  assert.match(populatedRun.finalHtml, /data-budget-worker="task_run_1">预设 3m</);
+  assert.match(populatedRun.finalHtml, /data-remaining-worker="task_run_1"/);
+  assert.match(populatedRun.finalHtml, /status-text timed_out">已超时</);
+  // Collapsed HTTP 404 error shows concise summary without leaking raw HTML tags
+  assert.match(populatedRun.finalHtml, /worker-err-badge">HTTP 404</);
+  assert.match(populatedRun.finalHtml, /ai\.mindflow\.com\.cn · 重试 5 次/);
+  assert.doesNotMatch(populatedRun.finalHtml, /&lt;html&gt;/);
+
+  // Expanding the HTTP 404 worker renders structured metrics, KV metadata, error callout (without assertive alert), and collapsed raw log toggle
+  populatedRun.dispatchClick({
+    id: '',
+    closest(sel) {
+      if (sel === '[data-toggle-worker]') return { getAttribute: () => 'task_http404_3' };
+      return null;
+    },
+  });
+  assert.match(populatedRun.finalHtml, /class="error-callout "/);
+  assert.doesNotMatch(populatedRun.finalHtml, /class="error-callout[^"]*" role="alert"/);
+  assert.match(populatedRun.finalHtml, /上游接口返回 404 Not Found/);
+  assert.match(populatedRun.finalHtml, /class="detail-metrics detail-metrics-4"/);
+  assert.match(populatedRun.finalHtml, /class="detail-metrics detail-metrics-3"/);
+  assert.match(populatedRun.finalHtml, /class="detail-kv"/);
+  assert.match(populatedRun.finalHtml, /data-toggle-raw-error="task_http404_3" aria-expanded="false"/);
+  assert.doesNotMatch(populatedRun.finalHtml, /class="error-raw-pre"/);
+
+  // Expanding raw error log reveals full escaped raw output inside bounded pre and restores focus
+  populatedRun.dispatchClick({
+    id: '',
+    closest(sel) {
+      if (sel === '[data-toggle-raw-error]') return { getAttribute: () => 'task_http404_3' };
+      return null;
+    },
+  });
+  assert.match(populatedRun.finalHtml, /data-toggle-raw-error="task_http404_3" aria-expanded="true"/);
+  assert.match(populatedRun.finalHtml, /class="error-raw-pre" data-raw-error-worker="task_http404_3"/);
+  assert.equal(
+    populatedRun.focusCalls.some((c) => c.selector === '[data-toggle-raw-error="task_http404_3"]'),
+    true
+  );
+
+  // When dragon GIFs are injected, both workshop stage and worker rows render animated dragon images
+  const dragonRun = await runAppInMockVm({
+    dragonGifs: {
+      idle: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+      thinking: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+      coding: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+      reviewing: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+      completed: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+      failed: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+    },
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      async json() {
+        return basePayload;
+      },
+    }),
+  });
+  assert.match(dragonRun.finalHtml, /id="workshop-stage"/);
+  assert.match(dragonRun.finalHtml, /class="stage-dragon"[^>]*data-dragon-state="reviewing"/);
+  assert.match(dragonRun.finalHtml, /data-stage-worker="task_run_1"/);
+  assert.match(dragonRun.finalHtml, /class="worker-dragon"[^>]*data-dragon-worker="task_run_1" data-dragon-state="reviewing"/);
+  assert.match(dragonRun.finalHtml, /class="worker-dragon"[^>]*data-dragon-worker="task_http404_3" data-dragon-state="failed"/);
+});
+
+test('model picker supports ArrowUp/ArrowDown/Escape, outside click, poll focus preservation, and strict settings validation', async () => {
+  // Strict /api/settings default_model validation rejects non-strings instead of coercing
+  assert.equal(parseSettingsDefaultModel(undefined), null);
+  assert.equal(parseSettingsDefaultModel(null), null);
+  assert.equal(parseSettingsDefaultModel('   '), null);
+  assert.equal(parseSettingsDefaultModel(' gpt-6.2-sol '), 'gpt-6.2-sol');
+  for (const bad of [123, true, false, {}, ['gpt-6.2-sol'], 'bad model name']) {
+    assert.throws(() => parseSettingsDefaultModel(bad), (err) => err?.statusCode === 400);
+  }
+
+  let pollTick = 0;
+  const run = await runAppInMockVm({
+    fetchImpl: async () => {
+      pollTick += 1;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            generated_at: Date.now() / 1000,
+            scope: 'conversation',
+            conversation_id: '11111111-1111-1111-1111-111111111111',
+            has_conversation: true,
+            subagent_count: 0,
+            cli_status: { binary_found: true, auth_ready: true, default_model: 'gpt-6.2-sol' },
+            settings: {
+              default_model: null,
+              effective_model: 'gpt-6.2-sol',
+              codex_default_model: 'gpt-6.2-sol',
+              source: 'codex',
+              available_models: [
+                { id: 'gpt-6-astra', label: 'gpt-6-astra' },
+                { id: 'gpt-6.2-sol', label: 'gpt-6.2-sol' },
+              ],
+            },
+            stats: {
+              total_workers: 1,
+              running_count: 1,
+              completed_count: 0,
+              failed_count: 0,
+              tokens: {
+                input_tokens: 1000 * pollTick,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 1000 * pollTick,
+                cache_hit_rate: 0,
+              },
+              total_elapsed_ms: 5000 * pollTick,
+              avg_elapsed_ms: 5000 * pollTick,
+              total_changed_files: 0,
+              success_rate: 0,
+              by_model: [],
+              by_effort: [],
+              by_mode: [],
+            },
+            workers: [
+              {
+                task_id: 'task_live_1',
+                mode: 'review',
+                status: 'running',
+                model: 'gpt-6.2-sol',
+                reasoning_effort: 'medium',
+                elapsed_ms: 5000 * pollTick,
+                max_duration_seconds: 180,
+                remaining_ms: 175000,
+                tokens: { total_tokens: 1000 * pollTick },
+              },
+            ],
+          };
+        },
+      };
+    },
+  });
+
+  // Open picker; activeElement is still the trigger button (not an option)
+  run.dispatchClick({
+    id: 'btn-model-picker',
+    closest(sel) {
+      if (sel === 'button') return { id: 'btn-model-picker' };
+      if (sel === '#model-picker') return {};
+      return null;
+    },
+  });
+  run.setActiveElement({
+    id: 'btn-model-picker',
+    hasAttribute: () => false,
+    getAttribute: () => null,
+  });
+
+  // ArrowUp from trigger focuses the LAST option (gpt-6.2-sol), not second-to-last
+  assert.equal(run.dispatchKeydown('ArrowUp'), true);
+  assert.equal(run.activeElement?.getAttribute('data-select-model'), 'gpt-6.2-sol');
+
+  // ArrowDown wraps to the FIRST option ("" = Follow Codex)
+  assert.equal(run.dispatchKeydown('ArrowDown'), true);
+  assert.equal(run.activeElement?.getAttribute('data-select-model'), '');
+
+  // Poll re-render while open preserves focus on the empty-string Follow Codex option
+  const prevFocusLen = run.focusCalls.length;
+  await run.triggerNextPoll();
+  assert.equal(
+    run.focusCalls.slice(prevFocusLen).some((c) => c.selector === '[data-select-model=""]'),
+    true
+  );
+
+  // Escape closes picker and restores focus to #btn-model-picker
+  const preEscLen = run.focusCalls.length;
+  run.dispatchKeydown('Escape');
+  assert.doesNotMatch(run.finalHtml, /class="model-menu"/);
+  assert.equal(
+    run.focusCalls.slice(preEscLen).some((c) => c.selector === '#btn-model-picker'),
+    true
+  );
+
+  // Re-open and verify outside click dismisses menu
+  run.dispatchClick({
+    id: 'btn-model-picker',
+    closest(sel) {
+      if (sel === 'button') return { id: 'btn-model-picker' };
+      if (sel === '#model-picker') return {};
+      return null;
+    },
+  });
+  assert.match(run.finalHtml, /class="model-menu"/);
+  run.dispatchClick({
+    id: '',
+    closest: () => null,
+  });
+  assert.doesNotMatch(run.finalHtml, /class="model-menu"/);
 });
